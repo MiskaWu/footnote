@@ -1,0 +1,44 @@
+# 本機開發環境（WSL + NVIDIA 顯卡）：Postgres + pgvector、TEI 嵌入、TEI 重排序跑在 GPU。
+# footnote 本身直接在主機上跑。沒有 GPU 的環境改用 compose.cpu.yaml。
+#
+# WSL 不需要裝 NVIDIA container toolkit：把 /dev/dxg 與 /usr/lib/wsl（驅動的 libcuda）掛進容器即可。
+# 原生 Linux 改用 NVIDIA Container Toolkit：devices 換成 ["nvidia.com/gpu=all"]（CDI），拿掉 /usr/lib/wsl 的掛載與 LD_LIBRARY_PATH。
+# 映像用 turing 版（RTX 20 系列）；30 系列以上改用 89-/86- 開頭的 tag。
+# 對外 port 刻意避開常見預設值（5432、8080…），以免和本機其他服務衝突；都只綁 127.0.0.1。
+name: footnote
+
+x-tei-gpu: &tei-gpu
+  image: ghcr.io/huggingface/text-embeddings-inference:turing-1.8
+  devices: ["/dev/dxg:/dev/dxg"]
+  environment:
+    LD_LIBRARY_PATH: /usr/lib/wsl/lib
+  volumes:
+    - /usr/lib/wsl:/usr/lib/wsl:ro
+    - tei-cache:/data
+  restart: unless-stopped
+
+services:
+  db:
+    image: docker.io/pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_USER: footnote
+      POSTGRES_PASSWORD: footnote
+      POSTGRES_DB: footnote
+    ports: ["127.0.0.1:25432:5432"]
+    volumes: [db-data:/var/lib/postgresql/data]
+    restart: unless-stopped
+
+  # 預設的 16384 batch tokens 在預熱時會吃光顯卡記憶體；片段最長約 1200 字，4096 足夠
+  tei-embed:
+    <<: *tei-gpu
+    command: ["--model-id", "BAAI/bge-m3", "--port", "80", "--max-batch-tokens", "4096", "--auto-truncate"]
+    ports: ["127.0.0.1:28080:80"]
+
+  tei-rerank:
+    <<: *tei-gpu
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--port", "80", "--max-batch-tokens", "4096", "--auto-truncate"]
+    ports: ["127.0.0.1:28081:80"]
+
+volumes:
+  db-data:
+  tei-cache:

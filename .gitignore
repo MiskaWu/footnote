@@ -1,0 +1,24 @@
+# build
+/footnote
+/bin/
+/dist/
+
+# test
+*.test
+*.out
+coverage.*
+
+# 本機設定與 secret（設定範本是 footnote.example.yaml）
+/footnote.yaml
+.env
+.env.*
+!.env.example
+config.local.yaml
+
+# footnote eval --save 的輸出
+/eval/results/
+
+# editor
+.idea/
+.vscode/
+*.swp

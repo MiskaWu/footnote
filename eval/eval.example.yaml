@@ -1,0 +1,60 @@
+# footnote 評估集範例（plan §8），題目針對 examples/ 的虛構語料。
+# 跑法：make eval（等於 footnote eval -f eval/eval.example.yaml --sweep）
+#
+# 每題三種 expect：
+#   answer   文件裡有答案；sources 列預期出處，命中任一即可
+#   no_data  文件裡確定沒有的問題（拒答題）
+#   general  一般技術問題，不是這個組織特有的知識；計分時當 no_data
+#
+# sources 寫成 project_path:path[#標題路徑]。標題路徑要和片段的標題完全一致（Markdown 是「H1 › H2」；
+# xlsx 是分頁名）；能寫到標題就寫到標題，只寫檔名的話，同檔案裡無關的段落排在前面也算命中，評估會放水。
+# FAQ 卡也可以當出處（例如 acme/faq:deploy/rollback-prod.md）。
+#
+# 這份只是格式示範，題數遠不夠校準 τ_answer。實際使用時用真實問過的問題補到 30–50 題以上，
+# 其中拒答題（no_data + general）至少 20 題，見 plan §13 Q8。
+
+# ---- 文件裡有答案 ----
+- q: 正式環境要怎麼回滾到上一版？
+  expect: answer
+  sources:
+    - acme/handbook:deploy/rollback.md#回滾 › 回滾步驟
+    - acme/faq:deploy/rollback-prod.md
+- q: 回滾的時候資料庫 migration 會一起倒回去嗎？
+  expect: answer
+  sources: ["acme/handbook:deploy/rollback.md#回滾 › 資料庫 migration 怎麼辦"]
+- q: 哪幾天可以發版？
+  expect: answer
+  sources: ["acme/handbook:deploy/release.md#發版流程"]
+- q: 正式環境的金絲雀部署要觀察多久才全量？
+  expect: answer
+  sources: ["acme/handbook:deploy/release.md#發版流程 › 打 tag 與部署"]
+- q: 資料庫快照保留幾天？
+  expect: answer
+  sources: ["acme/handbook:ops/backup.md#備份與還原 › 備份排程"]
+- q: 誤刪資料要怎麼還原到某個時間點？
+  expect: answer
+  sources:
+    - acme/handbook:ops/backup.md#備份與還原 › 還原到新的資料庫
+    - acme/faq:ops/restore-backup.md
+- q: TLS 憑證外洩要怎麼換？
+  expect: answer
+  sources: ["acme/handbook:ops/certs.md#TLS 憑證 › 手動輪替"]
+- q: SEV2 事故多久內要回應？
+  expect: answer
+  sources: ["acme/handbook:ops/oncall.md#值班與事故處理 › 事故分級"]
+
+# ---- 文件裡沒有（應拒答）----
+- q: 員工旅遊補助要怎麼申請？
+  expect: no_data
+- q: 前端的設計系統用的是什麼字型？
+  expect: no_data
+- q: 行動 App 的推播通知是用哪一家服務？
+  expect: no_data
+- q: 客服工單多久內要第一次回覆？
+  expect: no_data
+
+# ---- 一般技術問題 ----
+- q: Go 的 errgroup 怎麼用？
+  expect: general
+- q: git rebase 和 merge 有什麼差別？
+  expect: general

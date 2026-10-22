@@ -1,0 +1,37 @@
+# 沒有 GPU 時用的版本：TEI 跑 CPU。make up COMPOSE_FILE=deploy/compose.cpu.yaml
+# 注意：XLM-R large 在 CPU 上每秒只有約 200–300 tokens，重排序 30 個片段要 60 秒以上，
+# 只適合確認流程能跑，不適合實際試問；兩個模型合計也要吃約 11GB 記憶體。
+# 對外 port 刻意避開常見預設值（5432、8080…），以免和本機其他服務衝突；都只綁 127.0.0.1。
+name: footnote
+
+services:
+  db:
+    image: docker.io/pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_USER: footnote
+      POSTGRES_PASSWORD: footnote
+      POSTGRES_DB: footnote
+    ports: ["127.0.0.1:25432:5432"]
+    volumes: [db-data:/var/lib/postgresql/data]
+    restart: unless-stopped
+
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    # 片段最長約 1200 字，2048 tokens 足夠；預設的 8192／16384 在預熱時會吃掉 13GB 被 OOM kill
+    command: ["--model-id", "BAAI/bge-m3", "--port", "80", "--max-batch-tokens", "2048", "--auto-truncate"]
+    mem_limit: 7g
+    ports: ["127.0.0.1:28080:80"]
+    volumes: [tei-cache:/data]
+    restart: unless-stopped
+
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--port", "80", "--max-batch-tokens", "2048", "--auto-truncate"]
+    mem_limit: 7g
+    ports: ["127.0.0.1:28081:80"]
+    volumes: [tei-cache:/data]
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  tei-cache:

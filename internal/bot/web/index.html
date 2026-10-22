@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>footnote 本機測試</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+TC:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1f2328; --muted: #6b7280; --line: #e5e7eb;
+  --accent: #2f6feb; --me: #e8f0fe; --notice: #fff7e0; --quote: #f3f4f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --text: #e6e6e6; --muted: #9aa0a6; --line: #2e3238;
+    --accent: #6ea8fe; --me: #1f2a3d; --notice: #3a3320; --quote: #262a30;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", Inter, "Noto Sans TC", sans-serif;
+  font-size: 15px; line-height: 1.6;
+}
+.mono { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; }
+header { padding: 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { margin: 0; font-size: 20px; font-weight: 800; letter-spacing: -.02em; }
+header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding: 16px; max-width: 1280px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+.bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.bar label { color: var(--muted); font-size: 13px; }
+input, textarea, button { font: inherit; color: inherit; }
+input, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+textarea { width: 100%; resize: vertical; min-height: 64px; }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer; font-weight: 600; }
+button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); font-weight: 500; }
+button:disabled { opacity: .5; cursor: default; }
+#log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; max-height: 62vh; overflow-y: auto; }
+.msg { padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); overflow-wrap: anywhere; }
+.msg.me { background: var(--me); align-self: flex-end; max-width: 85%; }
+.msg.bot { background: var(--panel); }
+.msg.notice { background: var(--notice); }
+.msg .meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.msg blockquote { margin: 2px 0 2px 0; padding: 2px 10px; background: var(--quote); border-left: 3px solid var(--line); color: var(--muted); font-size: 13px; }
+.msg a { color: var(--accent); }
+.fb { margin-top: 8px; display: flex; gap: 6px; align-items: center; }
+.fb button { padding: 4px 10px; font-size: 13px; }
+.fb span { color: var(--muted); font-size: 13px; }
+.gap { border-top: 1px solid var(--line); padding: 10px 0; }
+.gap:first-of-type { border-top: 0; }
+.tag { display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); margin-right: 4px; }
+h2 { margin: 0 0 8px; font-size: 16px; font-weight: 700; }
+.hint { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>footnote 本機測試</h1>
+  <p>扮演 Discord：同一個討論串裡的提問會被當成追問。👎 會記成知識缺口；缺口解決時，通知會出現在原討論串。</p>
+</header>
+<main>
+  <section>
+    <div class="bar">
+      <label>使用者 <input id="user" value="tester" size="10"></label>
+      <span class="hint">討論串 <span id="thread" class="mono"></span></span>
+      <button class="ghost" id="newThread">開新討論串</button>
+    </div>
+    <div id="log"></div>
+    <form id="form">
+      <textarea id="q" placeholder="問一個開發相關的問題，例如：正式環境要怎麼回滾？（Enter 送出，Shift+Enter 換行）"></textarea>
+      <div class="bar" style="margin-top:8px"><button id="send">送出</button><span class="hint" id="status"></span></div>
+    </form>
+  </section>
+  <section>
+    <div class="bar" style="justify-content:space-between"><h2>知識缺口</h2><button class="ghost" id="refresh">重新整理</button></div>
+    <p class="hint">改狀態用 CLI：<span class="mono">footnote gaps dismiss|close|needs-human &lt;id&gt;</span></p>
+    <div id="gaps"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const threads = new Map(); // thread → 最後看到的 notice id
+let thread = newThreadId();
+
+function newThreadId() {
+  const id = "t-" + Date.now().toString(36);
+  threads.set(id, 0);
+  return id;
+}
+function showThread() { $("thread").textContent = thread; }
+showThread();
+
+function esc(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+// 只處理回覆會用到的 Markdown：masked link、引用行、換行。
+function md(text) {
+  const lines = esc(text).split("\n");
+  return lines.map((line) => {
+    line = line.replace(/\[((?:\\\]|\\\[|[^\]])+)\]\(&lt;(.+?)&gt;\)/g, (_, label, url) =>
+      `<a href="${url}" target="_blank" rel="noopener">${label.replace(/\\([\[\]])/g, "$1")}</a>`);
+    if (line.startsWith("&gt; ")) return `<blockquote>${line.slice(5)}</blockquote>`;
+    return line + "<br>";
+  }).join("");
+}
+
+function add(kind, html, meta) {
+  const el = document.createElement("div");
+  el.className = "msg " + kind;
+  el.innerHTML = (meta ? `<div class="meta">${esc(meta)}</div>` : "") + html;
+  $("log").appendChild(el);
+  $("log").scrollTop = $("log").scrollHeight;
+  return el;
+}
+
+async function api(path, body) {
+  const res = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function ask() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("q").value = "";
+  $("send").disabled = true;
+  $("status").textContent = "查詢中…";
+  add("me", esc(q).replace(/\n/g, "<br>"), $("user").value);
+  try {
+    const t0 = performance.now();
+    const rep = await api("/api/ask", { thread, user: $("user").value, question: q });
+    const el = add("bot", md(rep.text), `footnote · ${rep.status} · ${Math.round(performance.now() - t0)} ms`);
+    if (rep.status === "faq" || rep.status === "docs") feedbackBar(el, rep.ask_id);
+    if (rep.status === "no_data") loadGaps();
+  } catch (e) {
+    add("bot", esc(String(e)), "錯誤");
+  } finally {
+    $("send").disabled = false;
+    $("status").textContent = "";
+  }
+}
+
+function feedbackBar(el, askId) {
+  const bar = document.createElement("div");
+  bar.className = "fb";
+  bar.innerHTML = `<button class="ghost" data-v="1">👍 有幫助</button><button class="ghost" data-v="-1">👎 沒幫助</button><span></span>`;
+  bar.querySelectorAll("button").forEach((b) => b.onclick = async () => {
+    bar.querySelectorAll("button").forEach((x) => x.disabled = true);
+    try {
+      const r = await api("/api/feedback", { ask_id: askId, user: $("user").value, vote: Number(b.dataset.v) });
+      bar.querySelector("span").textContent = r.text;
+      loadGaps();
+    } catch (e) { bar.querySelector("span").textContent = String(e); }
+  });
+  el.appendChild(bar);
+}
+
+async function pollNotices() {
+  for (const [t, after] of threads) {
+    try {
+      const list = await api(`/api/notices?thread=${encodeURIComponent(t)}&after=${after}`);
+      for (const n of list) {
+        add("notice", md(n.body), `通知 · 討論串 ${t}${t === thread ? "" : "（較早的討論串）"}`);
+        threads.set(t, n.id);
+      }
+    } catch (e) { /* 伺服器重啟中，下次再試 */ }
+  }
+}
+
+const statusName = { open: "待處理", maybe_resolved: "可能已解決", needs_human: "需要人補", closed: "已解決", dismissed: "一般技術問題" };
+async function loadGaps() {
+  try {
+    const list = await api("/api/gaps");
+    $("gaps").innerHTML = list.length ? list.map((g) => `
+      <div class="gap">
+        <div><span class="tag mono">G${g.id}</span><span class="tag">${statusName[g.status] || g.status}</span><span class="tag">${g.kind}</span><span class="tag">${g.hits} 次</span></div>
+        <div>${esc(g.question)}</div>
+        ${g.note ? `<div class="hint">${esc(g.note)}</div>` : ""}
+      </div>`).join("") : `<p class="hint">還沒有缺口。</p>`;
+  } catch (e) { $("gaps").textContent = String(e); }
+}
+
+$("form").onsubmit = (e) => { e.preventDefault(); ask(); };
+$("q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(); }
+});
+$("newThread").onclick = () => { thread = newThreadId(); showThread(); add("bot", "（開了新的討論串，之後的提問不會串接前面的問題）"); };
+$("refresh").onclick = loadGaps;
+loadGaps();
+setInterval(pollNotices, 4000);
+</script>
+</body>
+</html>

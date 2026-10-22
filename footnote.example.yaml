@@ -1,0 +1,53 @@
+# footnote 設定範例。複製成 footnote.yaml 再改：cp footnote.example.yaml footnote.yaml
+# （make 的 migrate／ingest／serve 發現沒有 footnote.yaml 時會自動複製這份。）
+# 資料庫連線字串走環境變數 FOOTNOTE_DATABASE_URL（Makefile 會帶本機預設值）；secret 一律不寫進這個檔案。
+#
+# 這份預設指向 repo 內 examples/ 的虛構語料（「Acme 平台」的維運手冊與 FAQ 卡），可以直接跑示範。
+# 相對路徑以這個設定檔所在的目錄為準；dir 是 git repo 根目錄時，讀 ref 已 commit 的內容（LFS 會還原）。
+
+# 回覆裡的出處連結以這個網址組成：{gitlab_url}/{project_path}/-/blob/{ref}/{path}
+gitlab_url: https://gitlab.example.com
+
+sources:
+  - name: handbook
+    project_path: acme/handbook     # GitLab 上的專案路徑，顯示與組連結用
+    dir: examples/handbook          # 本機 checkout；也可以寫 ~/src/handbook 這類路徑
+    ref: main
+    include: ["**/*.md", "**/*.xlsx"]
+    exclude: ["**/README.md"]
+    draft: ["drafts/**"]             # 命中的檔案在回覆標「草稿」
+    skip_sheets: ["備份", "backup", "廢棄"]  # xlsx 分頁名稱含這些字就略過
+    max_text_kb: 2048
+
+faq:
+  project_path: acme/faq
+  dir: examples/faq
+  ref: main
+  include: ["**/*.md"]
+  exclude: ["README.md", "CLAUDE.md", ".claude/**"]
+
+tei:
+  embed_url: http://127.0.0.1:28080
+  rerank_url: http://127.0.0.1:28081
+  embed_dim: 1024
+  timeout: 120s
+
+qa:
+  candidates: 30
+  k_reply: 3
+  excerpt_chars: 200
+  tau_answer: 0.40          # 作者在私有文件集上 sweep 的結果；換了語料請用 footnote eval --sweep 重新校準
+  tau_keep: 0.15
+  tau_dup: 0.85
+  history_turns: 1
+
+bot:
+  token_env: DISCORD_BOT_TOKEN   # 沒設這個環境變數就只開本機測試頁
+  channels: {}                   # 頻道 id → 允許的專案前綴；空的表示不限制
+  rate_limit: { per_minute: 6, per_day: 200 }
+
+server:
+  addr: 127.0.0.1:28090
+
+sync:
+  interval: 10m
