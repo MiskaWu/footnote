@@ -1,4 +1,4 @@
-// Package faq 解析與檢查 FAQ 卡（plan §7.6）。
+// Package faq 解析與檢查 FAQ 卡。
 package faq
 
 import (

@@ -14,7 +14,7 @@ type Finding struct {
 type rule struct {
 	name string
 	re   *regexp.Regexp
-	// valueGroup > 0 時，該群組若像佔位符就不算命中（見 plan §13 Q7）。
+	// valueGroup > 0 時，該群組若像佔位符就不算命中。
 	valueGroup int
 }
 

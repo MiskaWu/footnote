@@ -69,7 +69,7 @@ h2 { margin: 0 0 8px; font-size: 16px; font-weight: 700; }
     </div>
     <div id="log"></div>
     <form id="form">
-      <textarea id="q" placeholder="問一個開發相關的問題，例如：正式環境要怎麼回滾？（Enter 送出，Shift+Enter 換行）"></textarea>
+      <textarea id="q" placeholder="問一個開發相關的問題，例如：回滾要怎麼做？（Enter 送出，Shift+Enter 換行）"></textarea>
       <div class="bar" style="margin-top:8px"><button id="send">送出</button><span class="hint" id="status"></span></div>
     </form>
   </section>
@@ -132,7 +132,7 @@ async function ask() {
     const t0 = performance.now();
     const rep = await api("/api/ask", { thread, user: $("user").value, question: q });
     const el = add("bot", md(rep.text), `footnote · ${rep.status} · ${Math.round(performance.now() - t0)} ms`);
-    if (rep.status === "faq" || rep.status === "docs") feedbackBar(el, rep.ask_id);
+    if (rep.status === "faq" || rep.status === "docs" || rep.status === "answer") feedbackBar(el, rep.ask_id);
     if (rep.status === "no_data") loadGaps();
   } catch (e) {
     add("bot", esc(String(e)), "錯誤");

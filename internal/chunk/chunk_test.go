@@ -93,12 +93,12 @@ func TestLinesPacksRowsAndSplitsLongCell(t *testing.T) {
 		{N: 6, Text: strings.Repeat("明", 700)},
 		{N: 9, Text: strings.Repeat("長句。", 500)},
 	}
-	got := Lines("檢查清單", lines)
+	got := Lines("回滾", lines)
 	if got[0].LineStart != 2 || got[0].LineEnd != 5 {
 		t.Errorf("first chunk rows = %d-%d, want 2-5", got[0].LineStart, got[0].LineEnd)
 	}
 	for _, c := range got {
-		if c.Heading != "檢查清單" {
+		if c.Heading != "回滾" {
 			t.Errorf("heading = %q", c.Heading)
 		}
 		if n := utf8.RuneCountInString(c.Content); n > MaxChars {

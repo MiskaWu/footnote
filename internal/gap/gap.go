@@ -1,4 +1,4 @@
-// Package gap 管理知識缺口：去重、狀態指令、recheck、通知（plan §7.4、§7.5）。
+// Package gap 管理知識缺口：去重、狀態指令、recheck、通知。
 // 缺口狀態只存在 gaps 表；通知只寫 notices（outbox），由 serve 依平台送出。
 package gap
 

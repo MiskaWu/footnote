@@ -12,6 +12,7 @@ import (
 
 	"github.com/miskawu/footnote/internal/config"
 	"github.com/miskawu/footnote/internal/gap"
+	"github.com/miskawu/footnote/internal/kb"
 	"github.com/miskawu/footnote/internal/qa"
 	"github.com/miskawu/footnote/internal/render"
 	"github.com/miskawu/footnote/internal/store"
@@ -24,13 +25,22 @@ type Incoming struct {
 	ThreadRef  string
 	UserRef    string
 	Text       string
-	NoHistory  bool // DM：每則訊息都當新問題
+	DM         bool // 私訊：每則訊息都當新問題，權限查 bot.channels 的 "dm"
+}
+
+// ScopeKey 是查 bot.channels 用的 key：私訊一律是 "dm"，其他是頻道（討論串由平台換成上層頻道）。
+func (in Incoming) ScopeKey() string {
+	if in.DM {
+		return config.ScopeDM
+	}
+	return in.ChannelRef
 }
 
 type Reply struct {
-	AskID  int64  `json:"ask_id"`
-	Status string `json:"status"`
-	Text   string `json:"text"`
+	AskID  int64        `json:"ask_id"`
+	Status string       `json:"status"`
+	Text   string       `json:"text"`           // 純文字版（測試頁、提問紀錄）
+	Card   *render.Card `json:"card,omitempty"` // AI 回答與 FAQ 卡的卡片版面；平台能顯示卡片時用它（Discord embed）
 }
 
 type Handler struct {
@@ -39,6 +49,7 @@ type Handler struct {
 	Gaps     *gap.Service
 	Embedder qa.Embedder
 	Cfg      *config.Config
+	KB       *kb.Service // FAQ 提案的審核；沒設時審核按鈕回「不在審核名單」
 	Render   render.Options
 	Log      *slog.Logger
 	limiter  *Limiter
@@ -51,11 +62,16 @@ func NewHandler(st *store.Store, e *qa.Engine, g *gap.Service, emb qa.Embedder, 
 
 // OnQuestion 跑完整線上流程並寫 asks；maxLen 是平台的單則訊息上限（0 不限）。
 func (h *Handler) OnQuestion(ctx context.Context, in Incoming, maxLen int) (Reply, error) {
+	prefixes, ok := h.Cfg.Bot.Scope(in.ScopeKey())
+	if !ok {
+		h.Log.Info("question where not open", "platform", in.Platform, "scope", in.ScopeKey(), "user", in.UserRef)
+		return Reply{Status: "closed", Text: render.ClosedText}, nil
+	}
 	if !h.limiter.Allow(in.Platform+":"+in.UserRef, time.Now()) {
 		return Reply{Status: "rate_limited", Text: render.RateText}, nil
 	}
 	var history []string
-	if !in.NoHistory && h.Cfg.QA.HistoryTurns > 0 {
+	if !in.DM && h.Cfg.QA.HistoryTurns > 0 {
 		var err error
 		history, err = h.Store.RecentQuestions(ctx, in.Platform, in.ThreadRef, h.Cfg.QA.HistoryTurns)
 		if err != nil {
@@ -63,7 +79,7 @@ func (h *Handler) OnQuestion(ctx context.Context, in Incoming, maxLen int) (Repl
 		}
 	}
 	ask := store.Ask{Platform: in.Platform, ChannelRef: in.ChannelRef, ThreadRef: in.ThreadRef, UserRef: in.UserRef, Question: in.Text}
-	res, err := h.QA.Run(ctx, in.Text, history, h.Cfg.Bot.Channels[in.ChannelRef])
+	res, err := h.QA.Run(ctx, in.Text, history, prefixes)
 	if err != nil {
 		// 外部呼叫失敗記 reason=error，不記成知識缺口
 		h.Log.Error("qa failed", "err", err, "question", in.Text)
@@ -74,6 +90,24 @@ func (h *Handler) OnQuestion(ctx context.Context, in Incoming, maxLen int) (Repl
 	}
 	ask.Query, ask.Status, ask.Reason, ask.TopScore = res.Query, res.Status, res.Reason, res.Top
 	ask.LatencyMS = int(res.Latency.Milliseconds())
+	if a := res.Answer; a != nil {
+		ask.GenModel, ask.InputTokens, ask.OutputTokens = a.Model, a.InputTokens, a.OutputTokens
+	}
+	rescue := ""
+	if rs := res.Rescue; rs != nil {
+		ask.RescueQuery, ask.Rescued = rs.Query, rs.Rescued
+		if u := rs.Usage; u != nil {
+			ask.RescueModel, ask.RescueInputTokens, ask.RescueOutputTokens = u.Model, u.InputTokens, u.OutputTokens
+		}
+		switch {
+		case rs.Rescued:
+			rescue = "rescued"
+		case rs.Skipped != "":
+			rescue = "skipped_" + rs.Skipped
+		default:
+			rescue = "failed"
+		}
+	}
 	for _, hit := range res.Hits {
 		ask.ChunkIDs = append(ask.ChunkIDs, hit.ID)
 	}
@@ -82,7 +116,8 @@ func (h *Handler) OnQuestion(ctx context.Context, in Incoming, maxLen int) (Repl
 		return Reply{}, err
 	}
 	var gi *render.GapInfo
-	if res.Status == qa.StatusNoData {
+	general := res.Answer != nil && res.Answer.Scope == "general" // 模型判斷是一般技術問題：不開缺口
+	if res.Status == qa.StatusNoData && !general {
 		g, err := h.Gaps.Record(ctx, id, in.Text, res.QueryVec, gap.KindNoData, res.NearMisses, nil)
 		if err != nil {
 			return Reply{}, err
@@ -95,8 +130,10 @@ func (h *Handler) OnQuestion(ctx context.Context, in Incoming, maxLen int) (Repl
 	if err := h.Store.SetAskReply(ctx, id, text); err != nil {
 		return Reply{}, err
 	}
-	h.Log.Info("ask", "ask_id", id, "platform", in.Platform, "status", res.Status, "top", res.Top, "latency_ms", ask.LatencyMS)
-	return Reply{AskID: id, Status: res.Status, Text: text}, nil
+	h.Log.Info("ask", "ask_id", id, "platform", in.Platform, "status", res.Status, "reason", res.Reason, "top", res.Top, "latency_ms", ask.LatencyMS,
+		"gen_model", ask.GenModel, "input_tokens", ask.InputTokens, "output_tokens", ask.OutputTokens, "gen_skipped", res.GenSkipped,
+		"rescue", rescue, "rescue_query", ask.RescueQuery)
+	return Reply{AskID: id, Status: res.Status, Text: text, Card: render.BuildCard(res, o)}, nil
 }
 
 // OnFeedback 記錄 👍／👎。👎 記一筆缺口：回 FAQ 卡的是 wrong_answer，回文件段落的是 unhelpful。
@@ -189,6 +226,44 @@ func (l *Limiter) Allow(key string, now time.Time) bool {
 type Sender interface {
 	Platform() string
 	Send(ctx context.Context, n store.Notice) error
+}
+
+// ReviewPoster 把 FAQ 提案貼到審核的地方，回傳訊息 id。
+type ReviewPoster interface {
+	PostReview(ctx context.Context, c store.KBChange, p kb.Preview) (string, error)
+}
+
+// RunReviewPoster 定期把還沒貼出去的提案貼到審核頻道。提案是指令列寫進資料庫的（代理在另一個行程），
+// 跟通知一樣靠輪詢；貼失敗的留著下次再貼。
+func RunReviewPoster(ctx context.Context, st *store.Store, svc *kb.Service, poster ReviewPoster, every time.Duration, log *slog.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		pending, err := st.KBUnposted(ctx)
+		if err != nil {
+			log.Error("unposted proposals", "err", err)
+		}
+		for _, c := range pending {
+			p, err := svc.BuildPreview(ctx, c)
+			if err != nil {
+				log.Error("build preview", "id", c.ID, "err", err)
+				continue
+			}
+			ref, err := poster.PostReview(ctx, c, p)
+			if err != nil {
+				log.Warn("post review failed", "id", c.ID, "err", err)
+				continue
+			}
+			if err := st.KBSetReviewRef(ctx, c.ID, ref); err != nil {
+				log.Error("set review ref", "id", c.ID, "err", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // RunDeliverer 定期把待送的通知交給對應平台；失敗的留著下次再送。

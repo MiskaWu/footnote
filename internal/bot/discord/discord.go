@@ -1,9 +1,10 @@
-// Package discord 是 Discord 平台實作（plan §7.8）：Gateway 連線、@ 或 DM 觸發、
+// Package discord 是 Discord 平台實作：Gateway 連線、@ 或 DM 觸發、
 // 頻道提問自動開討論串、👍／👎 按鈕、通知回原討論串並 @ 提問者。
 package discord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/miskawu/footnote/internal/bot"
+	"github.com/miskawu/footnote/internal/kb"
+	"github.com/miskawu/footnote/internal/render"
 	"github.com/miskawu/footnote/internal/store"
 )
 
@@ -20,6 +23,7 @@ const (
 	Platform  = "discord"
 	maxLen    = 2000
 	fbPrefix  = "fn:fb:"
+	rvPrefix  = "fn:rv:"
 	askTimout = 90 * time.Second
 )
 
@@ -47,7 +51,11 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err := b.Session.Open(); err != nil {
 		return fmt.Errorf("discord open: %w", err)
 	}
-	b.Log.Info("discord connected", "user", b.Session.State.User.Username)
+	if u := b.Session.State.User; u != nil { // Discord 沒回 READY 時 State.User 是空的
+		b.Log.Info("discord connected", "user", u.Username, "id", u.ID)
+	} else {
+		b.Log.Warn("discord connected without READY; mentions may not work")
+	}
 	<-ctx.Done()
 	return b.Session.Close()
 }
@@ -61,30 +69,43 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if !dm && !mentioned(m.Message, me) {
 		return
 	}
-	text := stripMention(m.Content, me)
-	if text == "" {
-		s.ChannelMessageSendReply(m.ChannelID, "請在 @ 後面直接寫問題，例如：@footnote 正式環境要怎麼回滾？", m.Reference())
+	in := bot.Incoming{Platform: Platform, UserRef: m.Author.ID, Text: stripMention(m.Content, me), DM: dm}
+	var ch *discordgo.Channel
+	if !dm {
+		ch = b.channel(m.ChannelID)
+	}
+	in.ChannelRef = m.ChannelID
+	if ch != nil && ch.IsThread() {
+		in.ChannelRef = ch.ParentID // 討論串的權限跟著上層頻道
+	}
+	// 先查這裡有沒有開放，再開討論串：沒開放的頻道不留下空的討論串（Handler 也會再擋一次）
+	if _, ok := b.Handler.Cfg.Bot.Scope(in.ScopeKey()); !ok {
+		b.Log.Info("question where not open", "channel", m.ChannelID, "scope", in.ScopeKey(), "user", m.Author.ID)
+		s.ChannelMessageSendReply(m.ChannelID, render.ClosedText, m.Reference())
+		return
+	}
+	if in.Text == "" {
+		s.ChannelMessageSendReply(m.ChannelID, "請在 @ 後面直接寫問題，例如：@footnote 回滾要怎麼做？", m.Reference())
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), askTimout)
 	defer cancel()
 
-	in := bot.Incoming{Platform: Platform, UserRef: m.Author.ID, Text: text, NoHistory: dm}
 	replyTo := m.ChannelID
-	switch ch := b.channel(m.ChannelID); {
+	switch {
 	case dm:
-		in.ChannelRef, in.ThreadRef = m.ChannelID, m.ChannelID
+		in.ThreadRef = m.ChannelID
 	case ch != nil && ch.IsThread():
-		in.ChannelRef, in.ThreadRef = ch.ParentID, ch.ID
+		in.ThreadRef = ch.ID
 	default:
 		th, err := s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{
-			Name: threadName(text), AutoArchiveDuration: 1440,
+			Name: threadName(in.Text), AutoArchiveDuration: 1440,
 		})
 		if err != nil {
 			b.Log.Warn("start thread failed; replying in channel", "err", err)
-			in.ChannelRef, in.ThreadRef = m.ChannelID, m.ID
+			in.ThreadRef = m.ID
 		} else {
-			in.ChannelRef, in.ThreadRef, replyTo = m.ChannelID, th.ID, th.ID
+			in.ThreadRef, replyTo = th.ID, th.ID
 		}
 	}
 	s.ChannelTyping(replyTo)
@@ -95,12 +116,14 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 		s.ChannelMessageSend(replyTo, "系統暫時無法回答，請稍後再試。")
 		return
 	}
-	msg := &discordgo.MessageSend{
-		Content:         rep.Text,
-		Flags:           discordgo.MessageFlagsSuppressEmbeds,
-		AllowedMentions: &discordgo.MessageAllowedMentions{},
+	msg := &discordgo.MessageSend{AllowedMentions: &discordgo.MessageAllowedMentions{}}
+	if rep.Card != nil {
+		msg.Embeds = []*discordgo.MessageEmbed{cardEmbed(rep.Card)}
+	} else {
+		msg.Content = rep.Text
+		msg.Flags = discordgo.MessageFlagsSuppressEmbeds // 訊息裡的 GitLab 連結不要各自展開成預覽
 	}
-	if rep.Status == "faq" || rep.Status == "docs" {
+	if rep.Status == "faq" || rep.Status == "docs" || rep.Status == "answer" {
 		msg.Components = feedbackButtons(rep.AskID)
 	}
 	if _, err := s.ChannelMessageSendComplex(replyTo, msg); err != nil {
@@ -109,34 +132,194 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if i.Type != discordgo.InteractionMessageComponent {
-		return
+	switch i.Type {
+	case discordgo.InteractionMessageComponent:
+		switch id := i.MessageComponentData().CustomID; {
+		case strings.HasPrefix(id, fbPrefix):
+			b.onFeedback(s, i, id)
+		case strings.HasPrefix(id, rvPrefix):
+			b.onReviewButton(s, i, id)
+		}
+	case discordgo.InteractionModalSubmit:
+		if d := i.ModalSubmitData(); strings.HasPrefix(d.CustomID, rvPrefix) {
+			b.onRejectReason(s, i, d)
+		}
 	}
-	id := i.MessageComponentData().CustomID
-	if !strings.HasPrefix(id, fbPrefix) {
-		return
-	}
-	askID, vote, ok := parseFeedbackID(id)
-	if !ok {
-		return
-	}
-	user := ""
+}
+
+func interactionUser(i *discordgo.InteractionCreate) string {
 	if i.Member != nil && i.Member.User != nil {
-		user = i.Member.User.ID
-	} else if i.User != nil {
-		user = i.User.ID
+		return i.Member.User.ID
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), askTimout)
-	defer cancel()
-	text, err := b.Handler.OnFeedback(ctx, askID, user, vote)
-	if err != nil {
-		b.Log.Error("on feedback", "err", err)
-		text = "記錄失敗，請稍後再試。"
+	if i.User != nil {
+		return i.User.ID
 	}
+	return ""
+}
+
+// ephemeral 回一則只有按的人看得到的訊息。
+func ephemeral(s *discordgo.Session, i *discordgo.InteractionCreate, text string) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: text, Flags: discordgo.MessageFlagsEphemeral},
 	})
+}
+
+func (b *Bot) onFeedback(s *discordgo.Session, i *discordgo.InteractionCreate, id string) {
+	askID, vote, ok := parseFeedbackID(id)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), askTimout)
+	defer cancel()
+	text, err := b.Handler.OnFeedback(ctx, askID, interactionUser(i), vote)
+	if err != nil {
+		b.Log.Error("on feedback", "err", err)
+		text = "記錄失敗，請稍後再試。"
+	}
+	ephemeral(s, i, text)
+}
+
+// ---- FAQ 提案的審核（bot.ReviewPoster）----
+
+// PostReview 把提案貼到審核頻道，附核准、退回按鈕。
+func (b *Bot) PostReview(ctx context.Context, c store.KBChange, p kb.Preview) (string, error) {
+	msg, err := b.Session.ChannelMessageSendComplex(b.Handler.Cfg.Bot.ReviewChannel, &discordgo.MessageSend{
+		Embeds:          []*discordgo.MessageEmbed{reviewEmbed(c, p)},
+		Components:      reviewButtons(c.ID),
+		AllowedMentions: &discordgo.MessageAllowedMentions{},
+	})
+	if err != nil {
+		return "", err
+	}
+	return msg.ID, nil
+}
+
+func (b *Bot) onReviewButton(s *discordgo.Session, i *discordgo.InteractionCreate, id string) {
+	changeID, action, ok := parseReviewID(id)
+	if !ok {
+		return
+	}
+	user := interactionUser(i)
+	if b.Handler.KB == nil || !b.Handler.KB.CanReview(user) {
+		ephemeral(s, i, kb.ErrNotReviewer.Error()+"。")
+		return
+	}
+	if action == "reject" {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseModal,
+			Data: &discordgo.InteractionResponseData{
+				CustomID: rvPrefix + strconv.FormatInt(changeID, 10) + ":reason",
+				Title:    "退回提案",
+				Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+					discordgo.TextInput{CustomID: "reason", Label: "退回原因（寫卡的代理會看到）", Style: discordgo.TextInputParagraph, Required: true, MaxLength: 500},
+				}}},
+			},
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), askTimout)
+	defer cancel()
+	err := b.Handler.KB.Approve(ctx, changeID, user)
+	b.finishReview(s, i, err, "✅ <@"+user+"> 已核准，馬上同步上線。")
+}
+
+func (b *Bot) onRejectReason(s *discordgo.Session, i *discordgo.InteractionCreate, d discordgo.ModalSubmitInteractionData) {
+	changeID, _, ok := parseReviewID(d.CustomID)
+	if !ok || b.Handler.KB == nil {
+		return
+	}
+	reason := modalText(d)
+	user := interactionUser(i)
+	ctx, cancel := context.WithTimeout(context.Background(), askTimout)
+	defer cancel()
+	err := b.Handler.KB.Reject(ctx, changeID, user, reason)
+	b.finishReview(s, i, err, "↩️ <@"+user+"> 已退回："+reason)
+}
+
+// finishReview 收掉提案訊息的按鈕，把結果寫在訊息上；沒通過再次檢查時按鈕留著，只告訴按的人。
+func (b *Bot) finishReview(s *discordgo.Session, i *discordgo.InteractionCreate, err error, done string) {
+	var lint *kb.LintError
+	switch {
+	case errors.As(err, &lint):
+		ephemeral(s, i, clip(err.Error(), maxLen))
+		return
+	case errors.Is(err, kb.ErrNotReviewer):
+		ephemeral(s, i, err.Error()+"。")
+		return
+	case errors.Is(err, kb.ErrDecided):
+		done = err.Error() + "。"
+	case err != nil:
+		b.Log.Error("review", "err", err)
+		ephemeral(s, i, "審核失敗，請稍後再試。")
+		return
+	}
+	data := &discordgo.InteractionResponseData{
+		Content: done, Components: []discordgo.MessageComponent{}, AllowedMentions: &discordgo.MessageAllowedMentions{},
+	}
+	if i.Message != nil {
+		data.Embeds = i.Message.Embeds // 這個欄位留空會把原本的卡片清掉
+	}
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{Type: discordgo.InteractionResponseUpdateMessage, Data: data})
+}
+
+func modalText(d discordgo.ModalSubmitInteractionData) string {
+	for _, c := range d.Components {
+		row, ok := c.(*discordgo.ActionsRow)
+		if !ok {
+			continue
+		}
+		for _, x := range row.Components {
+			if t, ok := x.(*discordgo.TextInput); ok {
+				return strings.TrimSpace(t.Value)
+			}
+		}
+	}
+	return ""
+}
+
+// reviewEmbed 是審核時看到的卡片：修改看差異，新增與刪除看卡片本身。
+func reviewEmbed(c store.KBChange, p kb.Preview) *discordgo.MessageEmbed {
+	var desc strings.Builder
+	switch {
+	case p.Diff != "":
+		// 留空間給 code block 的框；內容裡的三個反引號拆開，不然會把框提早關掉
+		desc.WriteString("```diff\n" + clip(strings.ReplaceAll(p.Diff, "```", "` ` `"), embedDescMax-16) + "\n```")
+	default:
+		desc.WriteString(clip(p.Body, embedDescMax))
+	}
+	e := &discordgo.MessageEmbed{
+		Title:       clip(fmt.Sprintf("提案 #%d：%s", c.ID, p.Title), embedTitleMax),
+		Description: desc.String(),
+		Color:       cardColors["partial"],
+		Footer:      &discordgo.MessageEmbedFooter{Text: "提案者：" + c.ProposedBy},
+	}
+	field := func(name, v string) {
+		if v != "" {
+			e.Fields = append(e.Fields, &discordgo.MessageEmbedField{Name: name, Value: clip(v, embedFieldMax)})
+		}
+	}
+	field("回答的缺口", p.Gap)
+	field("說明", c.Note)
+	field("問法與來源", strings.Join(p.Lines, "\n"))
+	return e
+}
+
+func reviewButtons(id int64) []discordgo.MessageComponent {
+	s := strconv.FormatInt(id, 10)
+	return []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+		discordgo.Button{Label: "核准上線", Style: discordgo.SuccessButton, CustomID: rvPrefix + s + ":approve"},
+		discordgo.Button{Label: "退回", Style: discordgo.SecondaryButton, CustomID: rvPrefix + s + ":reject"},
+	}}}
+}
+
+func parseReviewID(id string) (int64, string, bool) {
+	idPart, action, ok := strings.Cut(strings.TrimPrefix(id, rvPrefix), ":")
+	n, err := strconv.ParseInt(idPart, 10, 64)
+	if !ok || err != nil || (action != "approve" && action != "reject" && action != "reason") {
+		return 0, "", false
+	}
+	return n, action, true
 }
 
 // ---- 通知（bot.Sender）----
@@ -159,6 +342,71 @@ func (b *Bot) Send(ctx context.Context, n store.Notice) error {
 		AllowedMentions: &discordgo.MessageAllowedMentions{Users: []string{n.UserRef}},
 	})
 	return err
+}
+
+// ---- 卡片 ----
+
+// 邊條顏色：綠＝完整回答、黃＝部分回答或 FAQ 卡過期、藍＝FAQ 卡。
+var cardColors = map[string]int{"answered": 0x3BA55C, "partial": 0xF0B232, "stale": 0xF0B232, "faq": 0x5865F2}
+
+// Discord embed 的長度上限（字元）；留一點餘裕。
+const (
+	embedTitleMax  = 250
+	embedDescMax   = 4000
+	embedFieldMax  = 1000
+	embedFieldsMax = 20
+)
+
+// cardEmbed 把卡片轉成 embed：結論與條列放描述，注意事項一欄，出處放欄位（超過單欄上限就分成好幾欄），頁尾放提示。
+// embed 裡的連結不會產生預覽，所以不用 SUPPRESS_EMBEDS。
+func cardEmbed(c *render.Card) *discordgo.MessageEmbed {
+	e := &discordgo.MessageEmbed{
+		Title:       clip(c.Title, embedTitleMax),
+		Description: clip(c.Body, embedDescMax),
+		Color:       cardColors[c.Color],
+	}
+	if c.Footer != "" {
+		e.Footer = &discordgo.MessageEmbedFooter{Text: c.Footer}
+	}
+	if len(c.Notes) > 0 {
+		var lines []string
+		for _, n := range c.Notes {
+			lines = append(lines, "- "+n)
+		}
+		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{Name: "⚠ 注意", Value: clip(strings.Join(lines, "\n"), embedFieldMax)})
+	}
+	sourceStart := len(e.Fields)
+	var cur []string
+	size := 0
+	flush := func() {
+		if len(cur) == 0 || len(e.Fields) >= embedFieldsMax {
+			return
+		}
+		name := "出處"
+		if len(e.Fields) > sourceStart {
+			name = "\u200b" // 續欄不重複標題
+		}
+		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{Name: name, Value: strings.Join(cur, "\n")})
+		cur, size = nil, 0
+	}
+	for _, s := range c.Sources {
+		s = clip(s, embedFieldMax)
+		n := len([]rune(s)) + 1
+		if size+n > embedFieldMax {
+			flush()
+		}
+		cur, size = append(cur, s), size+n
+	}
+	flush()
+	return e
+}
+
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
 
 // ---- 小工具 ----

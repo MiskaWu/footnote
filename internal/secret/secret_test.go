@@ -3,16 +3,14 @@ package secret
 import "testing"
 
 func TestScan(t *testing.T) {
-	// 假密鑰刻意拆成兩段字串相接：Scan 收到的內容不變，但原始碼本身不會被 gitleaks、
-	// GitHub push protection 這類掃描器當成外洩的密鑰。
 	hits := []struct{ rule, text string }{
-		{"gitlab_pat", "token glpat-" + "abcdefghijklmnopqrstu1"},
-		{"slack_token", "SLACK=xoxb-" + "1234567890-abcdef"},
-		{"aws_access_key", "key AKIA" + "ABCDEFGHIJKLMNOP"},
-		{"private_key", "-----BEGIN RSA PRIVATE" + " KEY-----"},
-		{"private_key", "-----BEGIN PRIVATE" + " KEY-----"},
+		{"gitlab_pat", "token glpat-abcdefghijklmnopqrstu1"},
+		{"slack_token", "SLACK=xoxb-1234567890-abcdef"},
+		{"aws_access_key", "key AKIAABCDEFGHIJKLMNOP"},
+		{"private_key", "-----BEGIN RSA PRIVATE KEY-----"},
+		{"private_key", "-----BEGIN PRIVATE KEY-----"},
 		{"assignment", "password: hunter2hunter2"},
-		{"assignment", "DB_TOKEN = " + "9f8e7d6c5b4a"},
+		{"assignment", "DB_TOKEN = 9f8e7d6c5b4a"},
 	}
 	for _, h := range hits {
 		got := Scan(h.text)

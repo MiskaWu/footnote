@@ -27,7 +27,7 @@ const ns = `xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xm
 func TestRead(t *testing.T) {
 	data := build(t, map[string]string{
 		"xl/workbook.xml": `<workbook ` + ns + `><sheets>
-			<sheet name="概述" sheetId="1" r:id="rId1"/>
+			<sheet name="目的說明" sheetId="1" r:id="rId1"/>
 			<sheet name="隱藏" sheetId="2" state="hidden" r:id="rId2"/>
 		</sheets></workbook>`,
 		"xl/_rels/workbook.xml.rels": `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -35,8 +35,8 @@ func TestRead(t *testing.T) {
 			<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet2.xml"/>
 		</Relationships>`,
 		"xl/sharedStrings.xml": `<sst ` + ns + `>
-			<si><t>部署前檢查清單</t></si>
-			<si><r><t>先選</t></r><r><t>環境</t></r><rPh><t>カンキョウ</t></rPh></si>
+			<si><t>回滾操作流程</t></si>
+			<si><r><t>先選</t></r><r><t>版本</t></r><rPh><t>ハンポン</t></rPh></si>
 		</sst>`,
 		"xl/worksheets/sheet1.xml": `<worksheet ` + ns + `><sheetData>
 			<row r="2"><c r="A2" t="s"><v>0</v></c></row>
@@ -48,7 +48,7 @@ func TestRead(t *testing.T) {
 		</Relationships>`,
 		"xl/drawings/drawing1.xml": `<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
 			<xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:row>3</xdr:row></xdr:from><xdr:to><xdr:row>9</xdr:row></xdr:to>
-				<xdr:sp><xdr:txBody><a:p><a:r><a:t>點擊後</a:t></a:r><a:r><a:t>進入設定頁</a:t></a:r></a:p><a:p><a:r><a:t>第二段</a:t></a:r></a:p></xdr:txBody></xdr:sp>
+				<xdr:sp><xdr:txBody><a:p><a:r><a:t>點擊後</a:t></a:r><a:r><a:t>進入設定</a:t></a:r></a:p><a:p><a:r><a:t>第二段</a:t></a:r></a:p></xdr:txBody></xdr:sp>
 			</xdr:twoCellAnchor>
 			<xdr:twoCellAnchor><xdr:from><xdr:row>0</xdr:row></xdr:from><xdr:pic/></xdr:twoCellAnchor>
 		</xdr:wsDr>`,
@@ -63,13 +63,13 @@ func TestRead(t *testing.T) {
 		t.Fatalf("got %d sheets", len(wb.Sheets))
 	}
 	s := wb.Sheets[0]
-	if s.Name != "概述" || s.Hidden {
+	if s.Name != "目的說明" || s.Hidden {
 		t.Fatalf("sheet0 = %q hidden=%v", s.Name, s.Hidden)
 	}
 	want := []Line{
-		{Row: 2, Text: "部署前檢查清單"},
-		{Row: 4, Text: "點擊後進入設定頁 / 第二段", TextBox: true},
-		{Row: 5, Text: "先選環境 | 0.3 | 內嵌"},
+		{Row: 2, Text: "回滾操作流程"},
+		{Row: 4, Text: "點擊後進入設定 / 第二段", TextBox: true},
+		{Row: 5, Text: "先選版本 | 0.3 | 內嵌"},
 	}
 	if len(s.Lines) != len(want) {
 		t.Fatalf("lines = %+v", s.Lines)

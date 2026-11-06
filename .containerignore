@@ -1,0 +1,6 @@
+# 映像只需要 go.mod、go.sum、cmd/、internal/
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

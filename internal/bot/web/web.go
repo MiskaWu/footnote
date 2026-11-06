@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/miskawu/footnote/internal/bot"
+	"github.com/miskawu/footnote/internal/config"
 	"github.com/miskawu/footnote/internal/store"
 )
 
@@ -45,7 +46,7 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		req.User = "tester"
 	}
 	rep, err := s.Handler.OnQuestion(r.Context(), bot.Incoming{
-		Platform: Platform, ChannelRef: "web", ThreadRef: req.Thread, UserRef: req.User, Text: req.Question,
+		Platform: Platform, ChannelRef: config.ScopeWeb, ThreadRef: req.Thread, UserRef: req.User, Text: req.Question,
 	}, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

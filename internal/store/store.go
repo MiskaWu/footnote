@@ -56,14 +56,15 @@ func Migrate(ctx context.Context, url string, dim int) error {
 // ---- 同步 ----
 
 type FileMeta struct {
-	ProjectPath string
-	Path        string
-	Ref         string
-	BlobSHA     string
-	Kind        string // doc | faq
-	Draft       bool
-	Skipped     string // 非空表示略過
-	Pipeline    string // 處理設定指紋（見 ingest.Fingerprint）
+	ProjectPath  string
+	Path         string
+	Ref          string
+	BlobSHA      string
+	Kind         string // doc | faq
+	Draft        bool
+	SupersededBy string // 舊版：同組最新一份的路徑
+	Skipped      string // 非空表示略過
+	Pipeline     string // 處理設定指紋（見 ingest.Fingerprint）
 }
 
 type ChunkRow struct {
@@ -114,36 +115,93 @@ func (s *Store) ListFiles(ctx context.Context, project string) (map[string]Synce
 	return out, rows.Err()
 }
 
+// replaceFileTx 更新檔案的同步紀錄，並清掉這個檔案先前產出的所有東西（片段、FAQ 卡、詞彙表），
+// 讓呼叫端在同一個 transaction 裡寫入新的。檔案從卡片變成被略過、或從詞彙表變成壞掉時，舊的才不會留著。
+func replaceFileTx(ctx context.Context, tx pgx.Tx, f FileMeta) error {
+	var skipped *string
+	if f.Skipped != "" {
+		skipped = &f.Skipped
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO source_files (project_path, path, ref, blob_sha, synced_at, skipped, pipeline)
+		VALUES ($1, $2, $3, $4, now(), $5, $6)
+		ON CONFLICT (project_path, path) DO UPDATE
+		SET ref = EXCLUDED.ref, blob_sha = EXCLUDED.blob_sha, synced_at = now(), skipped = EXCLUDED.skipped, pipeline = EXCLUDED.pipeline`,
+		f.ProjectPath, f.Path, f.Ref, f.BlobSHA, skipped, f.Pipeline); err != nil {
+		return err
+	}
+	for _, q := range []string{
+		`DELETE FROM chunks WHERE project_path = $1 AND path = $2`,
+		`DELETE FROM faqs WHERE project_path = $1 AND path = $2`,
+		`DELETE FROM glossary WHERE project_path = $1 AND path = $2`,
+	} {
+		if _, err := tx.Exec(ctx, q, f.ProjectPath, f.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReplaceGlossary 收進一份詞彙表（整份換掉）。
+func (s *Store) ReplaceGlossary(ctx context.Context, f FileMeta, groups [][]string) error {
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if err := replaceFileTx(ctx, tx, f); err != nil {
+			return err
+		}
+		b, err := json.Marshal(groups)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO glossary (project_path, path, groups) VALUES ($1, $2, $3)`, f.ProjectPath, f.Path, b)
+		return err
+	})
+}
+
+// DocPaths 回傳索引裡所有文件（不含 FAQ 卡）的路徑，翻譯補查拿來整理成文件名稱。
+func (s *Store) DocPaths(ctx context.Context) ([]string, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT DISTINCT path FROM chunks WHERE kind = 'doc' ORDER BY path`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// Glossary 回傳所有詞彙表的叫法組（查詢時展開用）。沒有詞彙表時回傳 nil。
+func (s *Store) Glossary(ctx context.Context) ([][]string, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT groups FROM glossary ORDER BY project_path, path`)
+	if err != nil {
+		return nil, err
+	}
+	var out [][]string
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		var groups [][]string
+		if err := json.Unmarshal(b, &groups); err != nil {
+			return nil, err
+		}
+		out = append(out, groups...)
+	}
+	return out, rows.Err()
+}
+
 // ReplaceFile 在單一 transaction 內「刪舊片段、寫新片段、更新 blob_sha」，FAQ 卡一併更新。
 func (s *Store) ReplaceFile(ctx context.Context, f FileMeta, chunks []ChunkRow, faq *FAQRow) error {
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
-		var skipped *string
-		if f.Skipped != "" {
-			skipped = &f.Skipped
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO source_files (project_path, path, ref, blob_sha, synced_at, skipped, pipeline)
-			VALUES ($1, $2, $3, $4, now(), $5, $6)
-			ON CONFLICT (project_path, path) DO UPDATE
-			SET ref = EXCLUDED.ref, blob_sha = EXCLUDED.blob_sha, synced_at = now(), skipped = EXCLUDED.skipped, pipeline = EXCLUDED.pipeline`,
-			f.ProjectPath, f.Path, f.Ref, f.BlobSHA, skipped, f.Pipeline); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM chunks WHERE project_path = $1 AND path = $2`, f.ProjectPath, f.Path); err != nil {
+		if err := replaceFileTx(ctx, tx, f); err != nil {
 			return err
 		}
 		batch := &pgx.Batch{}
 		for _, c := range chunks {
 			batch.Queue(`
-				INSERT INTO chunks (project_path, path, ref, blob_sha, kind, draft, heading_path, line_start, line_end, content, embedding, tsv)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_tsvector('simple', $12))`,
-				f.ProjectPath, f.Path, f.Ref, f.BlobSHA, f.Kind, f.Draft, c.Heading, c.LineStart, c.LineEnd, c.Content,
+				INSERT INTO chunks (project_path, path, ref, blob_sha, kind, draft, superseded_by, heading_path, line_start, line_end, content, embedding, tsv)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, to_tsvector('simple', $13))`,
+				f.ProjectPath, f.Path, f.Ref, f.BlobSHA, f.Kind, f.Draft, f.SupersededBy, c.Heading, c.LineStart, c.LineEnd, c.Content,
 				pgvector.NewVector(c.Embedding), c.TSV)
 		}
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM faqs WHERE project_path = $1 AND path = $2`, f.ProjectPath, f.Path); err != nil {
 			return err
 		}
 		if faq == nil {
@@ -205,17 +263,40 @@ func (s *Store) TryLock(ctx context.Context, key int64) (release func(), ok bool
 // ---- 檢索 ----
 
 type Candidate struct {
-	ID          int64
-	ProjectPath string
-	Path        string
-	Ref         string
-	Kind        string
-	Draft       bool
-	Heading     string
-	LineStart   int
-	LineEnd     int
-	Content     string
-	RRF         float64
+	ID           int64
+	ProjectPath  string
+	Path         string
+	Ref          string
+	Kind         string
+	Draft        bool
+	SupersededBy string // 舊版：同組最新一份的路徑；空字串表示不是舊版
+	Heading      string
+	LineStart    int
+	LineEnd      int
+	Content      string
+	RRF          float64
+}
+
+// ChunksContaining 回傳內容含這段文字（不分大小寫、照字面）的片段：審核叫法時要知道它在全部文件裡怎麼用，
+// 語意檢索只給最像的幾名，找不到「同一個字在別的系統是別的意思」。
+func (s *Store) ChunksContaining(ctx context.Context, text string) ([]Candidate, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id, project_path, path, ref, kind, draft, superseded_by, heading_path, line_start, line_end, content, 0::float8
+		FROM chunks WHERE strpos(lower(content), lower($1)) > 0
+		ORDER BY kind, project_path, path, heading_path, line_start`, text)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Candidate
+	for rows.Next() {
+		var c Candidate
+		if err := rows.Scan(&c.ID, &c.ProjectPath, &c.Path, &c.Ref, &c.Kind, &c.Draft, &c.SupersededBy, &c.Heading, &c.LineStart, &c.LineEnd, &c.Content, &c.RRF); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // HybridSearch：向量 top k + FTS top k，RRF（k=60）合併取前 limit。
@@ -249,7 +330,7 @@ func (s *Store) HybridSearch(ctx context.Context, vec []float32, ftsQuery string
 					ORDER BY rank DESC LIMIT $4
 				) s
 			)
-			SELECT c.id, c.project_path, c.path, c.ref, c.kind, c.draft, c.heading_path, c.line_start, c.line_end, c.content,
+			SELECT c.id, c.project_path, c.path, c.ref, c.kind, c.draft, c.superseded_by, c.heading_path, c.line_start, c.line_end, c.content,
 			       COALESCE(1.0 / (60 + v.r), 0) + COALESCE(1.0 / (60 + f.r), 0) AS rrf
 			FROM chunks c
 			LEFT JOIN v ON v.id = c.id
@@ -269,7 +350,7 @@ func (s *Store) HybridSearch(ctx context.Context, vec []float32, ftsQuery string
 
 func scanCandidate(r pgx.CollectableRow) (Candidate, error) {
 	var c Candidate
-	err := r.Scan(&c.ID, &c.ProjectPath, &c.Path, &c.Ref, &c.Kind, &c.Draft, &c.Heading, &c.LineStart, &c.LineEnd, &c.Content, &c.RRF)
+	err := r.Scan(&c.ID, &c.ProjectPath, &c.Path, &c.Ref, &c.Kind, &c.Draft, &c.SupersededBy, &c.Heading, &c.LineStart, &c.LineEnd, &c.Content, &c.RRF)
 	return c, err
 }
 
@@ -403,7 +484,7 @@ func (s *Store) FAQsForGap(ctx context.Context, gapID int64) ([]FAQ, error) {
 // FAQChunk 回傳某張卡的片段（卡片整張一塊）。
 func (s *Store) FAQChunk(ctx context.Context, project, path string) (*Candidate, error) {
 	rows, err := s.Pool.Query(ctx, `
-		SELECT id, project_path, path, ref, kind, draft, heading_path, line_start, line_end, content, 0::float8
+		SELECT id, project_path, path, ref, kind, draft, superseded_by, heading_path, line_start, line_end, content, 0::float8
 		FROM chunks WHERE project_path = $1 AND path = $2 ORDER BY id LIMIT 1`, project, path)
 	if err != nil {
 		return nil, err
@@ -509,6 +590,13 @@ func (s *Store) TouchGapChecked(ctx context.Context, id int64) error {
 	return err
 }
 
+// GapQuestion 回傳缺口的代表問題。
+func (s *Store) GapQuestion(ctx context.Context, id int64) (string, error) {
+	var q string
+	err := s.Pool.QueryRow(ctx, `SELECT question FROM gaps WHERE id = $1`, id).Scan(&q)
+	return q, err
+}
+
 func (s *Store) GapExists(ctx context.Context, id int64) (bool, error) {
 	var ok bool
 	err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gaps WHERE id = $1)`, id).Scan(&ok)
@@ -554,6 +642,16 @@ type Ask struct {
 	LatencyMS  int
 	Feedback   *int16
 	CreatedAt  time.Time
+
+	GenModel     string // 有呼叫模型時：模型 id 與 token 用量
+	InputTokens  int64
+	OutputTokens int64
+
+	RescueQuery        string // 翻譯補查：改寫後拿去檢索的字串；沒試是空字串
+	Rescued            bool   // 回覆用的是補查的結果
+	RescueModel        string // 補查改寫的模型與用量（每月預算一起算）
+	RescueInputTokens  int64
+	RescueOutputTokens int64
 }
 
 func (s *Store) InsertAsk(ctx context.Context, a Ask) (int64, error) {
@@ -566,10 +664,36 @@ func (s *Store) InsertAsk(ctx context.Context, a Ask) (int64, error) {
 		a.ChunkIDs = []int64{}
 	}
 	err := s.Pool.QueryRow(ctx, `
-		INSERT INTO asks (platform, channel_ref, thread_ref, user_ref, question, query, status, reason, top_score, chunk_ids, latency_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
-		a.Platform, a.ChannelRef, a.ThreadRef, a.UserRef, a.Question, a.Query, a.Status, reason, a.TopScore, a.ChunkIDs, a.LatencyMS).Scan(&id)
+		INSERT INTO asks (platform, channel_ref, thread_ref, user_ref, question, query, status, reason, top_score, chunk_ids, latency_ms, gen_model, input_tokens, output_tokens,
+		                  rescue_query, rescued, rescue_model, rescue_input_tokens, rescue_output_tokens)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING id`,
+		a.Platform, a.ChannelRef, a.ThreadRef, a.UserRef, a.Question, a.Query, a.Status, reason, a.TopScore, a.ChunkIDs, a.LatencyMS,
+		a.GenModel, a.InputTokens, a.OutputTokens, a.RescueQuery, a.Rescued, a.RescueModel, a.RescueInputTokens, a.RescueOutputTokens).Scan(&id)
 	return id, err
+}
+
+// GenUsageSince 加總 since 之後各模型的 [輸入, 輸出] token（每月預算用）：整理回答與翻譯補查兩組一起算。
+func (s *Store) GenUsageSince(ctx context.Context, since time.Time) (map[string][2]int64, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT model, COALESCE(sum(i), 0), COALESCE(sum(o), 0) FROM (
+			SELECT gen_model AS model, input_tokens AS i, output_tokens AS o FROM asks WHERE gen_model <> '' AND created_at >= $1
+			UNION ALL
+			SELECT rescue_model, rescue_input_tokens, rescue_output_tokens FROM asks WHERE rescue_model <> '' AND created_at >= $1
+		) u GROUP BY model`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][2]int64{}
+	for rows.Next() {
+		var m string
+		var in, o int64
+		if err := rows.Scan(&m, &in, &o); err != nil {
+			return nil, err
+		}
+		out[m] = [2]int64{in, o}
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) SetAskGap(ctx context.Context, askID, gapID int64) error {
@@ -587,11 +711,11 @@ func (s *Store) SetAskFeedback(ctx context.Context, askID int64, vote int16) err
 	return err
 }
 
-const askCols = `id, gap_id, platform, channel_ref, thread_ref, user_ref, question, query, status, COALESCE(reason, ''), COALESCE(top_score, 0), chunk_ids, COALESCE(reply, ''), COALESCE(latency_ms, 0), feedback, created_at`
+const askCols = `id, gap_id, platform, channel_ref, thread_ref, user_ref, question, query, status, COALESCE(reason, ''), COALESCE(top_score, 0), chunk_ids, COALESCE(reply, ''), COALESCE(latency_ms, 0), feedback, created_at, rescue_query, rescued`
 
 func scanAsk(r pgx.CollectableRow) (Ask, error) {
 	var a Ask
-	err := r.Scan(&a.ID, &a.GapID, &a.Platform, &a.ChannelRef, &a.ThreadRef, &a.UserRef, &a.Question, &a.Query, &a.Status, &a.Reason, &a.TopScore, &a.ChunkIDs, &a.Reply, &a.LatencyMS, &a.Feedback, &a.CreatedAt)
+	err := r.Scan(&a.ID, &a.GapID, &a.Platform, &a.ChannelRef, &a.ThreadRef, &a.UserRef, &a.Question, &a.Query, &a.Status, &a.Reason, &a.TopScore, &a.ChunkIDs, &a.Reply, &a.LatencyMS, &a.Feedback, &a.CreatedAt, &a.RescueQuery, &a.Rescued)
 	return a, err
 }
 
@@ -605,6 +729,15 @@ func (s *Store) GetAsk(ctx context.Context, id int64) (*Ask, error) {
 		return nil, ErrNotFound
 	}
 	return &a, err
+}
+
+// RescuedAsks 回傳靠翻譯補查才答得出來的提問，新的在前：這些問法查得到，但每次都要多花一次模型，是詞彙表的候選。
+func (s *Store) RescuedAsks(ctx context.Context, limit int) ([]Ask, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT `+askCols+` FROM asks WHERE rescued ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAsk)
 }
 
 // RecentQuestions 回傳同一討論串最近 n 個問題，由舊到新。

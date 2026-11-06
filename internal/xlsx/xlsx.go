@@ -1,5 +1,5 @@
 // Package xlsx 從 xlsx 抽出文字：儲存格與文字方塊。只讀需要的 XML，不碰圖片，
-// 所以幾百 MB、塞滿截圖的企劃檔也讀得動。
+// 所以幾百 MB、塞滿截圖的規格檔也讀得動。
 package xlsx
 
 import (

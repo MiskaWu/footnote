@@ -7,15 +7,15 @@ import (
 
 const good = `---
 questions:
-  - 正式環境要怎麼回滾？
-  - 部署壞掉怎麼退回上一版
+  - 回滾要怎麼做？
+  - 回滾入口在哪
 sources:
-  - acme/handbook:deploy/rollback.md#回滾步驟
-  - acme/handbook:deploy/release-checklist.md#上線後
+  - acme/handbook:specs/21_回滾.xlsx#A.回滾步驟
+  - acme/handbook:specs/21_回滾清單.xlsx#清單
 gap: 3
 verified: 2026-10-08
 ---
-執行 acmectl rollback 退回上一個 release [1]。回滾後要在發布頻道公告 [2]。
+從主控台點回滾按鈕執行 [1]。清單由服務組成 [2]。
 `
 
 func TestParseGood(t *testing.T) {
@@ -26,7 +26,7 @@ func TestParseGood(t *testing.T) {
 	if len(c.Questions) != 2 || len(c.Sources) != 2 || c.Gap == nil || *c.Gap != 3 {
 		t.Fatalf("card = %+v", c)
 	}
-	if c.Sources[0].Project != "acme/handbook" || c.Sources[0].Path != "deploy/rollback.md" || c.Sources[0].Anchor != "回滾步驟" {
+	if c.Sources[0].Project != "acme/handbook" || c.Sources[0].Path != "specs/21_回滾.xlsx" || c.Sources[0].Anchor != "A.回滾步驟" {
 		t.Errorf("source0 = %+v", c.Sources[0])
 	}
 	if c.BodyLine != 11 {
@@ -75,10 +75,10 @@ func TestLintCheckSources(t *testing.T) {
 		if project != "acme/handbook" {
 			return "", false, false
 		}
-		return "sha", strings.HasSuffix(path, "rollback.md"), true
+		return "sha", strings.HasSuffix(path, "21_回滾.xlsx"), true
 	}
 	probs := strings.Join(Lint(c, resolve), "\n")
-	if !strings.Contains(probs, "找不到 deploy/release-checklist.md") {
+	if !strings.Contains(probs, "找不到 specs/21_回滾清單.xlsx") {
 		t.Errorf("probs = %s", probs)
 	}
 	c.Sources[0].Project = "secret/private"

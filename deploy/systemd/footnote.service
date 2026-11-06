@@ -1,0 +1,19 @@
+# footnote 問答機器人（Discord＋本機測試頁＋排程同步）。容器由 footnote-stack.service 先起好。
+# 安裝：在 footnote repo 根目錄跑 `make install-service`；改完程式用 `make restart`（重新 build 再重啟）。
+# 密鑰從 ~/.config/footnote/secrets.env 讀（不進版控）；log 在 journald：journalctl --user -u footnote -f
+# 不要同時再手動跑 `make serve`：兩個機器人會同時連上 Discord，每題回兩次。
+[Unit]
+Description=footnote 問答機器人
+Requires=footnote-stack.service
+After=footnote-stack.service
+
+[Service]
+WorkingDirectory=%h/projects/footnote
+EnvironmentFile=%h/.config/footnote/secrets.env
+Environment=FOOTNOTE_DATABASE_URL=postgres://footnote:footnote@127.0.0.1:25432/footnote
+ExecStart=%h/projects/footnote/bin/footnote serve
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

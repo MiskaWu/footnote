@@ -1,30 +1,31 @@
 # footnote 設定範例。複製成 footnote.yaml 再改：cp footnote.example.yaml footnote.yaml
-# （make 的 migrate／ingest／serve 發現沒有 footnote.yaml 時會自動複製這份。）
-# 資料庫連線字串走環境變數 FOOTNOTE_DATABASE_URL（Makefile 會帶本機預設值）；secret 一律不寫進這個檔案。
+# （make 的 migrate、ingest、serve 發現沒有 footnote.yaml 時會自動複製這份。）
+# 資料庫連線字串走環境變數 FOOTNOTE_DATABASE_URL（Makefile 會帶本機預設值）；secret 一律走環境變數。
 #
-# 這份預設指向 repo 內 examples/ 的虛構語料（「Acme 平台」的維運手冊與 FAQ 卡），可以直接跑示範。
-# 相對路徑以這個設定檔所在的目錄為準；dir 是 git repo 根目錄時，讀 ref 已 commit 的內容（LFS 會還原）。
+# 這份預設指向 repo 內 examples/ 的虛構語料（「Acme 平台」的維運手冊與 FAQ 卡），可以直接跑。
+# 相對路徑以這個設定檔所在的目錄為準；dir 是 git repo 根目錄時，讀 ref 已 commit 的內容，否則讀工作目錄。
 
 # 回覆裡的出處連結以這個網址組成：{gitlab_url}/{project_path}/-/blob/{ref}/{path}
 gitlab_url: https://gitlab.example.com
 
 sources:
   - name: handbook
-    project_path: acme/handbook     # GitLab 上的專案路徑，顯示與組連結用
-    dir: examples/handbook          # 本機 checkout；也可以寫 ~/src/handbook 這類路徑
+    project_path: acme/handbook      # GitLab 上的專案路徑，顯示與組連結用
+    dir: examples/handbook           # 本機 checkout；也可以寫 ~/src/handbook 這類路徑
     ref: main
+    # fetch: true                    # 同步前 git fetch，讀 origin/<ref>；本機 checkout 不動
+    # clone: https://…git            # dir 不存在時從這裡 clone（容器裡用）
     include: ["**/*.md", "**/*.xlsx"]
     exclude: ["**/README.md"]
-    draft: ["drafts/**"]             # 命中的檔案在回覆標「草稿」
-    skip_sheets: ["備份", "backup", "廢棄"]  # xlsx 分頁名稱含這些字就略過
+    draft: ["drafts/**"]             # 命中的檔案在回覆標「未確認設計」
+    skip_sheets: ["備份", "backup", "廢棄"]  # xlsx 分頁名稱含這些字就略過，不分大小寫
+    # 同一系統的多份文件，由新到舊。舊版回覆時排在新版後面、標「舊版，新版見 …」。
+    # versions:
+    #   - ["deploy/release-v2.md", "deploy/release.md"]
     max_text_kb: 2048
 
-faq:
-  project_path: acme/faq
-  dir: examples/faq
-  ref: main
-  include: ["**/*.md"]
-  exclude: ["README.md", "CLAUDE.md", ".claude/**"]
+faq:                                 # FAQ 卡與詞彙表存在資料庫（kb_changes），這只是來源的名稱，不是 GitLab 專案
+  project_path: acme/faq             # 第一次用 make import-examples 或 footnote faq import <目錄> 寫進資料庫
 
 tei:
   embed_url: http://127.0.0.1:28080
@@ -36,14 +37,40 @@ qa:
   candidates: 30
   k_reply: 3
   excerpt_chars: 200
-  tau_answer: 0.40          # 作者在私有文件集上 sweep 的結果；換了語料請用 footnote eval --sweep 重新校準
+  # 門檻只是起點：換了語料要用 footnote eval --sweep 重新校準，不要照抄。
+  tau_follow: 0.20          # 討論串追問時，本題單獨的重排分數也要過這個門檻
+  tau_answer: 0.45          # 閘門 A：重排最高分低於這個值就回沒有資料
   tau_keep: 0.15
   tau_dup: 0.85
+  k_max: 6                  # 送給模型的段落上限
   history_turns: 1
+
+anthropic:                  # 模型整理回答；API key 只走環境變數，沒設就回原文摘錄
+  api_key_env: ANTHROPIC_API_KEY
+  answer_model: claude-haiku-5-5
+  rewrite_model: claude-haiku-5-5  # 閘門 A 沒過時把問題裡的外文、口語補上文件說法再查一次；留空關閉
+  effort: low
+  max_tokens: 8000
+  monthly_budget_usd: 20     # 本月累計超過就退回原文摘錄；Console 另設花費上限當第二道防線
+  # 回答的寫法（語氣、長度、格式、人設），改完重啟機器人就生效；建議先用 footnote compare 看效果。
+  # 只根據文件、標出處、沒寫就說沒有的規則寫在程式裡（internal/llm），不能從這裡改，寫法跟規則衝突時以規則為準。
+  style: |
+    用繁體中文、白話來寫，像跟同事說明一樣，整理過、不要複雜；不要堆術語，文件裡的專有名詞第一次出現時用白話順帶說明。
+    summary 直接給結論，40 個字以內：問「能不能」「是不是」時先答能或不能、是或不是，問「為什麼」時先講文件寫的原因。
+    points 最多 4 點，每點 30 個字以內；文件有寫數字就拿數字當例子，例如「24 小時內」，不要只寫「有時間限制」。
+    要列舉很多項目時只挑 3 個重點，其他用「等」帶過；細節留給讀者點出處看原文。
 
 bot:
   token_env: DISCORD_BOT_TOKEN   # 沒設這個環境變數就只開本機測試頁
-  channels: {}                   # 頻道 id → 允許的專案前綴；空的表示不限制
+  # 哪裡可以問、能搜哪些專案：頻道 id → 允許的專案前綴（空清單＝全部）。表上沒有的頻道、私訊、測試頁
+  # 一律回「這裡沒有開放提問」。保留字："dm" 私訊、"web" 測試頁、"*" 其他全部（只給本機開發）。
+  # 頻道 id：在那個頻道 @ 機器人一次，log 的 "question where not open" 會印出 scope。
+  channels:
+    "*": []
+  # FAQ 提案貼到這個頻道，reviewers 列的人才能按核准或退回（Discord 使用者 id）。沒設時提案會一直待審：
+  # 核准只能由人在 Discord 按，指令列沒有這條路，代理不能審自己的卡。
+  review_channel: ""
+  reviewers: []
   rate_limit: { per_minute: 6, per_day: 200 }
 
 server:

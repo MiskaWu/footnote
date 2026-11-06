@@ -1,0 +1,20 @@
+# footnote 的 Postgres 與兩個 TEI 容器（照 deploy/compose.yaml 起，compose 是唯一的容器定義）。
+# 安裝：在 footnote repo 根目錄跑 `make install-service`。WSL 一啟動就會自動起來。
+# TEI 在 GPU 上載模型約 30 秒，等兩個都能回應才算啟動完成，footnote.service 才接著起。
+[Unit]
+Description=footnote 的資料庫與 TEI 容器（podman compose）
+Wants=podman-user-wait-network-online.service
+After=podman-user-wait-network-online.service podman.socket
+Requires=podman.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/projects/footnote
+ExecStart=/usr/bin/podman compose -f deploy/compose.yaml up -d
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 100); do /usr/bin/curl -sf -o /dev/null http://127.0.0.1:28080/health && /usr/bin/curl -sf -o /dev/null http://127.0.0.1:28081/health && exit 0; sleep 3; done; echo "TEI 5 分鐘內沒有準備好" >&2; exit 1'
+ExecStop=/usr/bin/podman compose -f deploy/compose.yaml stop
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

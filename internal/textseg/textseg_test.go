@@ -10,12 +10,12 @@ func TestTokens(t *testing.T) {
 		in   string
 		want []string
 	}{
-		{"部署流程", []string{"部署", "署流", "流程"}},
+		{"回滾流程", []string{"回滾", "滾流", "流程"}},
 		{"單", []string{"單"}},
-		{"Api Rate Limit", []string{"api", "rate", "limit"}},
-		{"一鍵部署v2功能", []string{"一鍵", "鍵部", "部署", "v2", "功能"}},
-		{"ReleaseNotesPanel_Special", []string{"releasenotespanel", "special"}},
-		{"延遲（P95）= 基準×1.1", []string{"延遲", "p95", "基準", "1", "1"}},
+		{"Disk Io Bar", []string{"disk", "io", "bar"}},
+		{"快速部署v2功能", []string{"快速", "速部", "部署", "v2", "功能"}},
+		{"LimitTimeGiftPack_Special", []string{"limittimegiftpack", "special"}},
+		{"費用（CP）= 流量×1.1", []string{"費用", "cp", "流量", "1", "1"}},
 		{"", nil},
 	}
 	for _, c := range cases {
@@ -26,7 +26,7 @@ func TestTokens(t *testing.T) {
 }
 
 func TestQueryDedupes(t *testing.T) {
-	if got, want := Query("部署 部署 deploy"), "部署 or deploy"; got != want {
+	if got, want := Query("回滾 回滾 rollback"), "回滾 or rollback"; got != want {
 		t.Errorf("Query = %q, want %q", got, want)
 	}
 }

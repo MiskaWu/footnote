@@ -1,0 +1,15 @@
+# 生成模型比較用的題目（footnote compare），題目針對 examples/ 的虛構語料。
+# 同一份檢索結果交給每個模型各回答一次，比較品質與花費。
+# expect 是期望的結果：answer＝文件答得出來；no_data＝分數過了閘門 A，但文件其實沒有答案。
+- q: 正式環境的金絲雀部署要觀察多久才全量？
+  sources: ["acme/handbook:deploy/release.md#發版流程 › 打 tag 與部署"]
+  expect: answer
+- q: 資料庫快照保留幾天？
+  sources: ["acme/handbook:ops/backup.md#備份與還原 › 備份排程"]
+  expect: answer
+- q: SEV2 事故多久內要回應？
+  sources: ["acme/handbook:ops/oncall.md#值班與事故處理 › 事故分級"]
+  expect: answer
+- q: 還原演練的結果要貼到哪個頻道？
+  sources: ["acme/handbook:ops/backup.md#備份與還原 › 還原演練"]
+  expect: no_data

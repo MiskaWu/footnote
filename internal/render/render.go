@@ -1,14 +1,18 @@
 // Package render 把問答結果排成回覆文字（Markdown，連結用 masked link）。
-// Discord 與本機測試頁共用同一份格式（plan §7.3、§7.8）。
+// Discord 與本機測試頁共用同一份格式。
 package render
 
 import (
 	"fmt"
 	"net/url"
 	"path"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/miskawu/footnote/internal/llm"
 	"github.com/miskawu/footnote/internal/qa"
 	"github.com/miskawu/footnote/internal/store"
 )
@@ -29,14 +33,18 @@ type GapInfo struct {
 
 const (
 	ErrorText    = "系統暫時無法回答，請稍後再試。"
-	GeneralText  = "內部文件沒有相關內容；這看起來是一般技術問題，建議查官方文件或改問通用的 AI 助理。"
+	GeneralText  = "內部文件沒有相關內容；這看起來是一般技術問題，可以直接問 Claude。"
 	RateText     = "問得有點快，請稍等一下再問。"
-	draftTag     = "（草稿）"
+	ClosedText   = "這裡沒有開放提問。"
+	AnswerNote   = "🤖 AI 依上列文件整理，請以原文為準｜沒幫上忙請按 👎"
 	maxQuoteRows = 4
 )
 
 // Reply 依結果排出回覆；超過 MaxLen 時先縮短摘錄，再減少筆數。
 func Reply(r *qa.Result, gap *GapInfo, o Options) string {
+	if r.Status == qa.StatusAnswer && o.MaxLen > 0 {
+		return fitAnswer(r, o)
+	}
 	if r.Status != qa.StatusDocs || o.MaxLen <= 0 {
 		return reply(r, gap, o, len(r.Hits))
 	}
@@ -64,12 +72,11 @@ func reply(r *qa.Result, gap *GapInfo, o Options, n int) string {
 				fmt.Fprintf(&b, "[%d] %s\n", s.Ord, sourceLink(s, o))
 			}
 		}
-		faqLink := Link(o.GitLabURL, h.ProjectPath, h.Ref, h.Path, 0)
-		fmt.Fprintf(&b, "FAQ · [%s](<%s>)", esc(h.Path), faqLink)
+		fmt.Fprintf(&b, "FAQ · %s", esc(h.Path)) // 卡片存在資料庫，沒有網址
 		if r.FAQ != nil {
 			fmt.Fprintf(&b, "（%s 確認）", r.FAQ.Verified.Format("2006-01-02"))
 			if r.FAQ.StaleSince != nil {
-				b.WriteString("\n⚠ 這張卡引用的檔案在確認後有變動，內容待重新確認。")
+				b.WriteString("\n" + staleNote)
 			}
 		}
 	case qa.StatusDocs:
@@ -87,8 +94,10 @@ func reply(r *qa.Result, gap *GapInfo, o Options, n int) string {
 			}
 		}
 		b.WriteString("沒找到想要的？按 👎，我會記成知識缺口。")
+	case qa.StatusAnswer:
+		b.WriteString(answerReply(r, o, r.Answer.Text))
 	default:
-		if gap != nil && gap.Status == "dismissed" {
+		if (gap != nil && gap.Status == "dismissed") || (r.Answer != nil && r.Answer.Scope == "general") {
 			return GeneralText
 		}
 		b.WriteString("目前內部文件沒有相關資料。\n")
@@ -115,29 +124,34 @@ func Notice(question, reply string) string {
 	return fmt.Sprintf("這題現在有答案了：「%s」\n\n%s", question, reply)
 }
 
-// Label 是片段的顯示名稱：專案末段 · 檔名 › 標題（xlsx 附列號）。
-func Label(c store.Candidate) string {
-	project := c.ProjectPath[strings.LastIndex(c.ProjectPath, "/")+1:]
-	s := fmt.Sprintf("%s · %s › %s", project, path.Base(c.Path), c.Heading)
-	if isSheet(c.Path) && c.LineStart > 0 {
-		if c.LineEnd > c.LineStart {
-			s += fmt.Sprintf("（第 %d–%d 列）", c.LineStart, c.LineEnd)
-		} else {
-			s += fmt.Sprintf("（第 %d 列）", c.LineStart)
-		}
+func hitLink(h qa.Hit, o Options) string {
+	s := textLink(qa.Label(h.Candidate), h, o)
+	if n := qa.Note(h.Candidate); n != "" {
+		s += "（" + n + "）"
 	}
 	return s
 }
 
-func hitLink(h qa.Hit, o Options) string {
-	s := fmt.Sprintf("[%s](<%s>)", esc(Label(h.Candidate)), Link(o.GitLabURL, h.ProjectPath, h.Ref, h.Path, h.LineStart))
-	if h.Draft {
-		s += draftTag
+// textLink 是純文字版的片段連結。FAQ 卡存在資料庫、沒有網址，只留文字。
+func textLink(label string, h qa.Hit, o Options) string {
+	if h.Kind == "faq" {
+		return esc(label)
 	}
-	return s
+	return fmt.Sprintf("[%s](<%s>)", esc(label), Link(o.GitLabURL, h.ProjectPath, h.Ref, h.Path, h.LineStart))
 }
 
 func sourceLink(s store.FAQSourceRow, o Options) string {
+	label, url := sourceLabelURL(s, o)
+	return fmt.Sprintf("[%s](<%s>)", esc(label), url)
+}
+
+// sourceMarkdown 是給卡片用的連結：embed 裡不會產生預覽，不需要角括號。
+func sourceMarkdown(s store.FAQSourceRow, o Options) string {
+	label, url := sourceLabelURL(s, o)
+	return fmt.Sprintf("[%s](%s)", esc(label), url)
+}
+
+func sourceLabelURL(s store.FAQSourceRow, o Options) (string, string) {
 	ref := o.Refs[s.SrcProject]
 	if ref == "" {
 		ref = "main"
@@ -146,7 +160,7 @@ func sourceLink(s store.FAQSourceRow, o Options) string {
 	if _, anchor, ok := strings.Cut(s.Ref, "#"); ok && anchor != "" {
 		label += " › " + anchor
 	}
-	return fmt.Sprintf("[%s](<%s>)", esc(label), Link(o.GitLabURL, s.SrcProject, ref, s.SrcPath, 0))
+	return label, Link(o.GitLabURL, s.SrcProject, ref, s.SrcPath, 0)
 }
 
 // Link 組 GitLab blob 連結。Markdown 用 ?plain=1#L{n}，因為 rendered Markdown 的行號錨點不可靠；
@@ -215,4 +229,118 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n-1]) + "…"
+}
+
+var (
+	citeRe    = regexp.MustCompile(`\[(\d+)\]`)
+	citeSpRe  = regexp.MustCompile(`\s*\[(\d+)\]`)
+	dupTextRe = regexp.MustCompile(`(\[\d+\])(\s*\[\d+\])+`)
+)
+
+// citeGroups 把回答引用到的段落（本文出現的 [n]，與閘門 C 同一個 llm.Cites；只留 1..len(hits)）依「同一檔案、同一分頁／標題」合併，
+// 由小到大編成 1、2、3……。xlsx 的連結只能到檔案，同一分頁的幾段分開列只是重複。
+// 回傳：原段落編號 → 新編號，以及每個新編號的代表段落（groups[k-1]）。純文字版與卡片都用它，編號一致。
+func citeGroups(text string, hits []qa.Hit) (map[int]int, []qa.Hit) {
+	var idx []int
+	for _, c := range llm.Cites(text) {
+		if c >= 1 && c <= len(hits) {
+			idx = append(idx, c)
+		}
+	}
+	sort.Ints(idx)
+	num := map[int]int{}
+	byKey := map[string]int{}
+	var groups []qa.Hit
+	for _, c := range idx {
+		h := hits[c-1]
+		key := h.ProjectPath + "\x00" + h.Path + "\x00" + h.Heading
+		k, ok := byKey[key]
+		if !ok {
+			groups = append(groups, h)
+			k = len(groups)
+			byKey[key] = k
+		}
+		num[c] = k
+	}
+	return num, groups
+}
+
+// relabelText 把本文的 [n] 換成新編號（純文字版）；不在對照表的拿掉，連續重複的合成一個。
+func relabelText(text string, num map[int]int) string {
+	text = citeRe.ReplaceAllStringFunc(text, func(m string) string {
+		c, _ := strconv.Atoi(m[1 : len(m)-1])
+		if k, ok := num[c]; ok {
+			return fmt.Sprintf("[%d]", k)
+		}
+		return ""
+	})
+	return dedupMarks(text, citeRe)
+}
+
+// dedupMarks 把連在一起的同一個編號（例如兩段同分頁的 [1][1]）合成一個。
+func dedupMarks(text string, re *regexp.Regexp) string {
+	return dupTextRe.ReplaceAllStringFunc(text, func(run string) string {
+		seen := map[string]bool{}
+		var out []string
+		for _, m := range re.FindAllString(run, -1) {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+		return strings.Join(out, "")
+	})
+}
+
+// groupLabel 是合併後出處的名稱：到分頁／標題為止，不帶列號（連結也只到檔案）。
+func groupLabel(h qa.Hit) string {
+	project := h.ProjectPath[strings.LastIndex(h.ProjectPath, "/")+1:]
+	return fmt.Sprintf("%s · %s › %s", project, path.Base(h.Path), h.Heading)
+}
+
+// answerReply 排整理過的回答（純文字版）。出處一律從完整的 a.Text 算，跟閘門 C 看的是同一份；
+// body 是實際顯示的本文，超過單則上限時 fitAnswer 傳縮短過的版本，切掉句尾的 [n] 也不會讓出處跟著消失。
+func answerReply(r *qa.Result, o Options, body string) string {
+	a := r.Answer
+	num, groups := citeGroups(a.Text, r.Hits)
+	var b strings.Builder
+	b.WriteString(relabelText(body, num))
+	if l := missingLine(a.Missing); a.Status == "partial" && l != "" {
+		b.WriteString("\n" + l)
+	}
+	b.WriteString("\n──\n")
+	for i, h := range groups {
+		fmt.Fprintf(&b, "[%d] %s", i+1, textLink(groupLabel(h), h, o))
+		if n := qa.Note(h.Candidate); n != "" {
+			b.WriteString("（" + n + "）")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(AnswerNote)
+	return b.String()
+}
+
+// fitAnswer：整理過的回答超過單則上限時，縮短回答本文，出處與提示保留。
+func fitAnswer(r *qa.Result, o Options) string {
+	s := reply(r, nil, o, len(r.Hits))
+	over := utf8.RuneCountInString(s) - o.MaxLen
+	if over <= 0 {
+		return s
+	}
+	text := []rune(r.Answer.Text)
+	body := string(text[:max(0, len(text)-over-1)]) + "…"
+	return truncate(answerReply(r, o, body), o.MaxLen)
+}
+
+// missingLine 是「文件沒寫」的那一行。模型的句子已經以「文件」開頭（例如「文件沒寫明……」）就原樣用，
+// 否則補上「文件沒寫：」；不去切模型的句子，免得切到詞中間。
+func missingLine(m string) string {
+	m = strings.TrimSpace(m)
+	switch {
+	case m == "":
+		return ""
+	case strings.HasPrefix(m, "文件"):
+		return "⚠ " + m
+	}
+	return "⚠ 文件沒寫：" + m
 }

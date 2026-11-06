@@ -28,9 +28,9 @@ type kwEmbed struct{}
 
 func vecFor(s string) []float32 {
 	switch {
-	case strings.Contains(s, "憑證"):
+	case strings.Contains(s, "回滾"):
 		return []float32{1, 0, 0, 0}
-	case strings.Contains(s, "備份"):
+	case strings.Contains(s, "憑證"):
 		return []float32{0, 1, 0, 0}
 	case strings.Contains(s, "errgroup"):
 		return []float32{0, 0, 1, 0}
@@ -52,7 +52,7 @@ type kwRerank struct{}
 func (kwRerank) Rerank(ctx context.Context, q string, docs []string) ([]float32, error) {
 	out := make([]float32, len(docs))
 	for i, d := range docs {
-		for _, kw := range []string{"憑證", "備份"} {
+		for _, kw := range []string{"回滾", "憑證"} {
 			if strings.Contains(q, kw) && strings.Contains(d, kw) {
 				out[i] = 0.9
 			}
@@ -128,9 +128,9 @@ func TestDedupDismissAndRecheck(t *testing.T) {
 	ctx := context.Background()
 
 	// 三種問法、同一主題 ⇒ 一個缺口、hits=3
-	g1 := ask(t, svc, "t1", "憑證要怎麼更新？")
-	g2 := ask(t, svc, "t2", "憑證更新的指令在哪")
-	g3 := ask(t, svc, "t3", "怎麼換憑證")
+	g1 := ask(t, svc, "t1", "回滾要怎麼做？")
+	g2 := ask(t, svc, "t2", "回滾入口在哪")
+	g3 := ask(t, svc, "t3", "怎麼做回滾")
 	if g1.ID != g2.ID || g2.ID != g3.ID || g3.Hits != 3 {
 		t.Fatalf("dedup failed: %d %d %d hits=%d", g1.ID, g2.ID, g3.ID, g3.Hits)
 	}
@@ -150,7 +150,7 @@ func TestDedupDismissAndRecheck(t *testing.T) {
 		t.Fatalf("recheck before doc: %+v %v", sum, err)
 	}
 	// 補了文件：no_data 缺口變 maybe_resolved，三個討論串各一則通知
-	addDoc(t, st, "acme/handbook", "certs.md", "憑證用 acmectl cert rotate 更新。")
+	addDoc(t, st, "acme/handbook", "rollback.md", "回滾從主控台執行。")
 	sum, err := svc.Recheck(ctx)
 	if err != nil || sum.MaybeResolved != 1 {
 		t.Fatalf("recheck after doc: %+v %v", sum, err)
@@ -174,14 +174,14 @@ func TestDedupDismissAndRecheck(t *testing.T) {
 func TestUnhelpfulNotAutoResolvedButFAQClosesIt(t *testing.T) {
 	svc, st := setup(t)
 	ctx := context.Background()
-	addDoc(t, st, "acme/handbook", "backup.md", "備份排程說明。")
+	addDoc(t, st, "acme/handbook", "certs.md", "憑證輪替說明。")
 
 	// 回了文件段落但被按 👎 ⇒ unhelpful；閘門 A 本來就會過，recheck 不能自動標成解決
-	id, err := st.InsertAsk(ctx, store.Ask{Platform: "web", ChannelRef: "web", ThreadRef: "t1", UserRef: "u", Question: "備份怎麼還原", Query: "備份怎麼還原", Status: "docs"})
+	id, err := st.InsertAsk(ctx, store.Ask{Platform: "web", ChannelRef: "web", ThreadRef: "t1", UserRef: "u", Question: "憑證輪替怎麼做", Query: "憑證輪替怎麼做", Status: "docs"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := svc.Record(ctx, id, "備份怎麼還原", vecFor("備份"), KindUnhelpful, nil, nil)
+	g, err := svc.Record(ctx, id, "憑證輪替怎麼做", vecFor("憑證"), KindUnhelpful, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,10 +192,10 @@ func TestUnhelpfulNotAutoResolvedButFAQClosesIt(t *testing.T) {
 	// FAQ 卡指向這個缺口 ⇒ closed 並通知卡片答案
 	gid := g.ID
 	err = st.ReplaceFile(ctx,
-		store.FileMeta{ProjectPath: "acme/faq", Path: "backup/restore.md", Ref: "main", BlobSHA: "faq1", Kind: "faq"},
-		[]store.ChunkRow{{Heading: "備份怎麼還原", LineStart: 7, LineEnd: 7, Content: "用 acmectl backup restore 指定快照還原 [1]。", Embedding: vecFor("備份"), TSV: textseg.Document("備份還原")}},
+		store.FileMeta{ProjectPath: "kb/faq", Path: "ops/certs.md", Ref: "main", BlobSHA: "faq1", Kind: "faq"},
+		[]store.ChunkRow{{Heading: "憑證輪替怎麼做", LineStart: 7, LineEnd: 7, Content: "到憑證頁按輪替完成 [1]。", Embedding: vecFor("憑證"), TSV: textseg.Document("憑證輪替")}},
 		&store.FAQRow{GapID: &gid, Verified: time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC), Sources: []store.FAQSourceRow{
-			{Ord: 1, Ref: "acme/handbook:backup.md", SrcProject: "acme/handbook", SrcPath: "backup.md", SrcBlobSHA: "sha-backup.md"},
+			{Ord: 1, Ref: "acme/handbook:certs.md", SrcProject: "acme/handbook", SrcPath: "certs.md", SrcBlobSHA: "sha-certs.md"},
 		}})
 	if err != nil {
 		t.Fatal(err)
@@ -208,21 +208,21 @@ func TestUnhelpfulNotAutoResolvedButFAQClosesIt(t *testing.T) {
 		t.Fatalf("status = %s", g.Status)
 	}
 	n := pending(t, st)
-	if len(n) != 1 || !strings.Contains(n[0].Body, "用 acmectl backup restore 指定快照還原") || !strings.Contains(n[0].Body, "FAQ ·") {
+	if len(n) != 1 || !strings.Contains(n[0].Body, "到憑證頁按輪替完成") || !strings.Contains(n[0].Body, "FAQ ·") {
 		t.Fatalf("notices = %+v", n)
 	}
 
 	// 來源 sha 變了 ⇒ 卡片過期
-	marked, err := st.MarkStaleFAQs(ctx, "acme/handbook", map[string]string{"backup.md": "sha-new"})
+	marked, err := st.MarkStaleFAQs(ctx, "acme/handbook", map[string]string{"certs.md": "sha-new"})
 	if err != nil || len(marked) != 1 {
 		t.Fatalf("marked = %v %v", marked, err)
 	}
-	stale, err := st.ListStaleFAQs(ctx, map[string]map[string]string{"acme/handbook": {"backup.md": "sha-new"}})
+	stale, err := st.ListStaleFAQs(ctx, map[string]map[string]string{"acme/handbook": {"certs.md": "sha-new"}})
 	if err != nil || len(stale) != 1 || len(stale[0].Changed) != 1 {
 		t.Fatalf("stale = %+v %v", stale, err)
 	}
 	// 已經過期的卡不重複標記
-	if marked, _ := st.MarkStaleFAQs(ctx, "acme/handbook", map[string]string{"backup.md": "sha-new"}); len(marked) != 0 {
+	if marked, _ := st.MarkStaleFAQs(ctx, "acme/handbook", map[string]string{"certs.md": "sha-new"}); len(marked) != 0 {
 		t.Fatalf("already-stale card marked again: %v", marked)
 	}
 }
@@ -230,12 +230,12 @@ func TestUnhelpfulNotAutoResolvedButFAQClosesIt(t *testing.T) {
 func TestCloseNotifiesOnlyWhenGatePasses(t *testing.T) {
 	svc, st := setup(t)
 	ctx := context.Background()
-	g := ask(t, svc, "t1", "憑證怎麼換")
+	g := ask(t, svc, "t1", "回滾怎麼做")
 	if notified, err := svc.Close(ctx, g.ID); err != nil || notified {
 		t.Fatalf("close without doc: notified=%v err=%v", notified, err)
 	}
-	g2 := ask(t, svc, "t2", "備份多久跑一次")
-	addDoc(t, st, "acme/handbook", "backup.md", "備份每天凌晨兩點執行。")
+	g2 := ask(t, svc, "t2", "憑證怎麼申請")
+	addDoc(t, st, "acme/handbook", "certs.md", "憑證從主控台申請。")
 	if notified, err := svc.Close(ctx, g2.ID); err != nil || !notified {
 		t.Fatalf("close with doc: notified=%v err=%v", notified, err)
 	}

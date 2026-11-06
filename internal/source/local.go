@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
 
@@ -25,8 +27,21 @@ type Local struct {
 	git bool
 }
 
+// Reader 是入庫看到的知識來源：本機 checkout（Local）或資料庫（DB）。
+type Reader interface {
+	Config() config.Source
+	List(ctx context.Context) (map[string]string, error) // 所有檔案的 path → sha
+	Selected(all map[string]string) map[string]string    // 依設定篩出要索引的檔案
+	IsDraft(path string) bool
+	Read(ctx context.Context, path string) ([]byte, error)
+}
+
 func NewLocal(ctx context.Context, cfg config.Source) (*Local, error) {
-	if _, err := os.Stat(cfg.Dir); err != nil {
+	_, err := os.Stat(cfg.Dir)
+	if errors.Is(err, fs.ErrNotExist) && cfg.Clone != "" {
+		err = clone(ctx, cfg)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("source %s: %w", cfg.Name, err)
 	}
 	l := &Local{Cfg: cfg}
@@ -38,6 +53,8 @@ func NewLocal(ctx context.Context, cfg config.Source) (*Local, error) {
 	}
 	return l, nil
 }
+
+func (l *Local) Config() config.Source { return l.Cfg }
 
 // List 回傳來源裡所有檔案（不經 include 篩選）的 path → blob sha。
 func (l *Local) List(ctx context.Context) (map[string]string, error) {
@@ -60,11 +77,79 @@ func (l *Local) Selected(all map[string]string) map[string]string {
 
 func (l *Local) IsDraft(path string) bool { return matchAny(l.Cfg.Draft, path) }
 
+// readRef 是實際讀取的 ref：設了 fetch 就讀 origin/<ref>（遠端最新），否則讀本機的 <ref>。
+func (l *Local) readRef() string {
+	if l.Cfg.Fetch {
+		return "origin/" + l.Cfg.Ref
+	}
+	return l.Cfg.Ref
+}
+
+// Fetch 從 origin 抓最新的 commit。只更新遠端參照，不動本機 checkout 的工作目錄與分支。
+// 不互動：要密碼或確認主機時直接失敗，由呼叫端記 warn、沿用上次抓到的內容。
+func (l *Local) Fetch(ctx context.Context) error {
+	if !l.git || !l.Cfg.Fetch {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", l.Cfg.Dir, "fetch", "--quiet", "origin")
+	cmd.Env = gitEnv()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git fetch %s: %v: %s", l.Cfg.Dir, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// clone 把 cfg.Clone 抓到 cfg.Dir。先抓到旁邊的暫存目錄、成功才改名，中途失敗不會留下半套 repo
+// 讓下一次誤以為已經 clone 好。--filter=blob:none 加 --no-checkout：只抓 commit 與目錄樹，
+// 讀檔時（cat-file）才向遠端要那一個檔，LFS 也是讀到才下載；設計文件的完整歷史有 2GB 以上，用不到。
+func clone(ctx context.Context, cfg config.Source) error {
+	parent := filepath.Dir(cfg.Dir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(parent, "."+filepath.Base(cfg.Dir)+".clone-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp) // 改名成功後 tmp 已不存在，這行什麼都不做
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "clone", "--quiet", "--no-checkout", "--filter=blob:none",
+		"--branch", cfg.Ref, cfg.Clone, tmp)
+	cmd.Env = gitEnv()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone %s: %v: %s", cfg.Clone, err, strings.TrimSpace(stderr.String()))
+	}
+	return os.Rename(tmp, cfg.Dir)
+}
+
+// gitEnv：碰遠端的 git 指令一律不互動，要密碼或確認主機時直接失敗，不會卡住。
+func gitEnv() []string {
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if os.Getenv("GIT_SSH_COMMAND") == "" {
+		env = append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+	}
+	return env
+}
+
 func (l *Local) Read(ctx context.Context, path string) ([]byte, error) {
 	if !l.git {
 		return os.ReadFile(filepath.Join(l.Cfg.Dir, filepath.FromSlash(path)))
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", l.Cfg.Dir, "cat-file", "--filters", l.Cfg.Ref+":"+path)
+	// attr.tree（git 2.46+）：LFS 等 filter 的設定（.gitattributes）從要讀的那個版本取，不看工作目錄。
+	// clone 時沒有展開工作目錄，不加這個會讀到 LFS 的指標檔；本機 checkout 的工作目錄也可能跟 ref 不同版。
+	// 不用 --attr-source：它會經由環境變數傳給補抓內容時遠端的 upload-pack，遠端解析不到這個 ref 就整個失敗；
+	// attr.tree 解析不到時當成空的，不會出錯。
+	// 讀檔可能要連遠端（部分 clone 補抓內容、LFS 下載），所以跟 fetch 一樣不互動。
+	cmd := exec.CommandContext(ctx, "git", "-C", l.Cfg.Dir, "-c", "attr.tree="+l.readRef(),
+		"cat-file", "--filters", l.readRef()+":"+path)
+	cmd.Env = gitEnv()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -75,12 +160,12 @@ func (l *Local) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (l *Local) listGit(ctx context.Context) (map[string]string, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", l.Cfg.Dir, "ls-tree", "-r", "-z", l.Cfg.Ref)
+	cmd := exec.CommandContext(ctx, "git", "-C", l.Cfg.Dir, "ls-tree", "-r", "-z", l.readRef())
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("git ls-tree %s: %v: %s", l.Cfg.Ref, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git ls-tree %s: %v: %s", l.readRef(), err, strings.TrimSpace(stderr.String()))
 	}
 	files := map[string]string{}
 	for _, rec := range bytes.Split(out, []byte{0}) {
