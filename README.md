@@ -1,59 +1,46 @@
 # footnote
 
-> **footnote** is a citation-first Q&A bot for a team's internal docs. It searches your repos (Markdown and
-> xlsx) and human-reviewed FAQ cards, then answers with a link to every source. Retrieval is hybrid
-> (pgvector + full-text, merged with RRF) and reranked by a self-hosted cross-encoder (TEI). If the top score
-> does not clear a calibrated threshold, footnote says it has nothing and records a *knowledge gap* instead of
-> guessing. FAQ cards are returned verbatim; other answers are written by Claude from the retrieved passages
-> only, and two more gates turn an unsupported answer back into "no data". Gaps are deduplicated, turned into
-> FAQ cards offline by an agent, approved by a human in Discord, and the original askers are notified.
-> Written in Go; Discord bot plus a local test page.
+給團隊內部文件用的問答機器人。在 Discord 問一句，它從 repo 裡的文件（Markdown、xlsx 試算表）和人審過的 FAQ 卡找答案，每則回覆都附出處連結。文件裡沒有的就明說沒有，同時把問題記成知識缺口，等文件或 FAQ 卡補上後，自動回頭通知當初發問的人。
 
-footnote 是給團隊內部文件用的「出處式」知識問答機器人：從 repo 的文件（Markdown、xlsx 試算表）與 FAQ 卡裡找答案，
-每則回覆都附出處連結。文件裡沒有的就明說「沒有」，同時把問題記成**知識缺口**；缺口由離線代理查證、寫成 FAQ 卡提案，
-人在 Discord 核准後，機器人自動回頭通知當初發問的人。
+適合文件放在 repo 裡、同樣的問題常被重複問，又需要知道答案從哪裡來的團隊。
 
-完整的設計脈絡見 [docs/design.md](docs/design.md)。
+English summary: [In English](#in-english)。完整的設計脈絡見 [docs/design.md](docs/design.md)。
 
-## 設計立場
+## 用起來長這樣
 
-- **線上回覆只有三種內容：** FAQ 卡原文、文件原文摘錄、Claude 依檢索到的段落整理的回答。第三種要附出處，
-  模型判斷文件沒有答案（閘門 B）或引用對不上（閘門 C）就改回「沒有資料」；API 出錯或當月花費超過預算就退回原文摘錄。
-- **FAQ 卡不經過模型。** 卡片是人審過的內容，照原文回，不改寫。
-- **查不到就說沒有。** 重排序後的最高分沒有通過閘門 A（`τ_answer`）就回沒有資料，不拿勉強相關的段落充數。
-  閾值不靠感覺，靠評估集 `footnote eval --sweep` 掃出來。
-- **知識缺口閉環。** 查不到、被按 👎 的問題都記成缺口，相似問法合併計數（`τ_dup`）。文件或 FAQ 卡更新後自動重檢，
-  解決了就回到原討論串通知提問者。缺口狀態只有一個來源：資料庫的 `gaps` 表。
-- **FAQ 卡也要有出處。** 每句事實標 `[n]` 對應來源檔案；引用的檔案一變動，卡片自動標成過期，回覆時附警示。
-- **代理不審自己的東西。** FAQ 卡只能由人在 Discord 核准，指令列沒有這條路。詞彙表例外，由另一個審核代理決定，
-  但一次只能加一組，要過程式檢查，人隨時能一行撤回。
-- **服務本身不呼叫代理。** 代理只做使用者啟動的離線工作，線上只用固定用途的 API 呼叫。
+下面的回覆都是對 repo 內附的虛構語料（「Acme 平台」的維運手冊）實際跑出來的。
 
-## 架構
+**問得到的：** 命中人審過的 FAQ 卡，照原文回，每句事實標 `[n]` 對應出處。
 
-```
-離線：同步與索引（serve 內每 10 分鐘；或手動 footnote ingest）
-  來源 checkout ─► 比對 blob sha ─► 抽文字（Markdown／xlsx）─► 密鑰掃描 ─► 切塊
-    ─► TEI /embed ─► Postgres（pgvector + tsvector）─► FAQ 過期偵測 ─► 重檢缺口
+> 正式環境要怎麼回滾到上一版？
 
-線上：回答一個問題
-  Discord／本機測試頁 ─►（同一討論串的追問：前一問＋本問串接）─► 依詞彙表補上文件的正式名稱
-    ─► 混合檢索：向量 top 40 + 全文 top 40，RRF 合併取 30 ─► TEI /rerank
-    ─► 閘門 A：最高分 < τ_answer ？
-         是 ─► 翻譯補查：模型把外文、口語換成文件用語再查一次
-              ─► 仍沒過 ─► 回「沒有資料」─► 缺口去重 ─► 記進 gaps
-         否 ─► 最高分是 FAQ 卡 ⇒ 回卡片原文＋出處
-               否則 ⇒ Claude 依段落整理（閘門 B、C）；沒有 API key 或超過預算時回原文摘錄
-    ─► 👎 ─► 缺口去重 ─► 記進 gaps
-
-離線：處理缺口（使用者自己啟動代理，例如 Claude Code 的 /handle-gaps）
-  footnote gaps --open --json ─► 查文件 ─► 寫 FAQ 卡 ─► footnote faq propose
-    ─► 人在 Discord 核准 ─► 同步 ─► 重檢 ─► 通知寫進 outbox（notices 表）─► 回原討論串通知
+```text
+執行 `acmectl rollback --env prod`，不加 `--to` 就會退回上一個版本，約需 3 分鐘 [1]。
+完成後到 Grafana 確認 5xx 比例恢復，並在 #release 頻道公告、開一張事故單 [1]。
+回滾不會倒回資料庫 migration；migration 規定向下相容，舊版程式可以直接跑在新的 schema 上 [2]。
+──
+[1] [handbook · rollback.md › 回滾步驟](<https://gitlab.example.com/acme/handbook/-/blob/main/deploy/rollback.md>)
+[2] [handbook · rollback.md › 資料庫 migration 怎麼辦](<https://gitlab.example.com/acme/handbook/-/blob/main/deploy/rollback.md>)
+FAQ · deploy/rollback-prod.md（2026-10-08 確認）
 ```
 
-技術：Go 1.25+、Postgres 18 + pgvector 0.8、[TEI](https://github.com/huggingface/text-embeddings-inference)
-跑 `BAAI/bge-m3`（嵌入）與 `BAAI/bge-reranker-v2-m3`（重排序）、Claude API（整理回答與翻譯補查）。
-全文檢索的中文切詞是純 Go 的 bigram，不需要 cgo。單一執行檔 `footnote`，模組切分見 [docs/design.md](docs/design.md)。
+**查不到的：** 不拿勉強相關的段落當答案，明說沒有，並把問題記成缺口。
+
+> 員工旅遊補助要怎麼申請？
+
+```text
+目前內部文件沒有相關資料。
+已記錄為知識缺口 G1（這個問題被問過 1 次）。最接近的文件是：
+· [handbook · oncall.md › 值班與事故處理 › 事後檢討](<https://gitlab.example.com/acme/handbook/-/blob/main/ops/oncall.md?plain=1#L13>)
+· [handbook · certs.md › TLS 憑證 › 自動更新](<https://gitlab.example.com/acme/handbook/-/blob/main/ops/certs.md?plain=1#L5>)
+補完文件後我會回到這個討論串通知你。
+```
+
+換個問法再問一次（「員工旅遊的補助要怎麼請？」），會併進同一個缺口，次數變成 2。
+
+沒有對應 FAQ 卡但文件裡有答案時，沒設 API key 就回文件段落的原文摘錄，設了就由 Claude 依檢索到的段落整理，一樣附出處。
+
+<sub>第一段是 `footnote ask` 的輸出（省略了它附加的除錯行），第二段是本機測試頁的回覆。這次沒有設 `ANTHROPIC_API_KEY`，所以 Claude 整理回答的路徑沒有實際執行。範例的出處連結指向 `gitlab.example.com`，點了不會通；回覆用 Markdown 連結，在 Discord 會顯示成可點的文字。</sub>
 
 ## 快速開始
 
@@ -62,7 +49,7 @@ footnote 是給團隊內部文件用的「出處式」知識問答機器人：�
 - `deploy/compose.yaml` 是 **WSL2 + NVIDIA 顯卡**的設定（掛 `/dev/dxg`，不需要 NVIDIA Container Toolkit）；
   映像用 `turing-1.8`（RTX 20 系列），30 系列以上請改用對應的 tag。
 - 沒有 GPU 時用 `deploy/compose.cpu.yaml`，流程可以跑通，但重排一題要一分鐘以上，只適合確認流程。
-- 第一次啟動 TEI 會從 Hugging Face 下載兩個模型，合計約 5GB。
+- 第一次啟動 TEI 會從 Hugging Face 下載兩個模型，合計約 4.3GB。
 
 ```sh
 make up               # Postgres + 兩個 TEI；沒有 GPU：make up COMPOSE_FILE=deploy/compose.cpu.yaml
@@ -128,6 +115,46 @@ journalctl --user -u footnote -f   # 看 log
 服務檔假設 repo 在 `~/projects/footnote`，放在別處要改 `deploy/systemd/`。
 裝成服務後就不要再手動 `make serve`，不然兩個機器人會同時連上 Discord，每題回兩次。
 
+## 設計立場
+
+- **線上回覆只有三種內容：** FAQ 卡原文、文件原文摘錄、Claude 依檢索到的段落整理的回答。第三種要附出處，
+  模型判斷文件沒有答案（閘門 B）或引用對不上（閘門 C）就改回「沒有資料」；API 出錯或當月花費超過預算就退回原文摘錄。
+- **FAQ 卡不經過模型。** 卡片是人審過的內容，照原文回，不改寫。
+- **查不到就說沒有。** 重排序後的最高分沒有通過閘門 A（`τ_answer`）就回沒有資料，不拿勉強相關的段落充數。
+  閾值不靠感覺，靠評估集 `footnote eval --sweep` 掃出來。
+- **知識缺口閉環。** 查不到、被按 👎 的問題都記成缺口，相似問法合併計數（`τ_dup`）。文件或 FAQ 卡更新後自動重檢，
+  解決了就回到原討論串通知提問者。缺口狀態只有一個來源：資料庫的 `gaps` 表。
+- **FAQ 卡也要有出處。** 每句事實標 `[n]` 對應來源檔案；引用的檔案一變動，卡片自動標成過期，回覆時附警示。
+- **代理不審自己的東西。** FAQ 卡只能由人在 Discord 核准，指令列沒有這條路。詞彙表例外，由另一個審核代理決定，
+  但一次只能加一組，要過程式檢查，人隨時能一行撤回。
+- **服務本身不呼叫代理。** 代理只做使用者啟動的離線工作，線上只用固定用途的 API 呼叫。
+
+## 架構
+
+```
+離線：同步與索引（serve 內每 10 分鐘；或手動 footnote ingest）
+  來源 checkout ─► 比對 blob sha ─► 抽文字（Markdown／xlsx）─► 密鑰掃描 ─► 切塊
+    ─► TEI /embed ─► Postgres（pgvector + tsvector）─► FAQ 過期偵測 ─► 重檢缺口
+
+線上：回答一個問題
+  Discord／本機測試頁 ─►（同一討論串的追問：前一問＋本問串接）─► 依詞彙表補上文件的正式名稱
+    ─► 混合檢索：向量 top 40 + 全文 top 40，RRF 合併取 30 ─► TEI /rerank
+    ─► 閘門 A：最高分 < τ_answer ？
+         是 ─► 翻譯補查：模型把外文、口語換成文件用語再查一次
+              ─► 仍沒過 ─► 回「沒有資料」─► 缺口去重 ─► 記進 gaps
+         否 ─► 最高分是 FAQ 卡 ⇒ 回卡片原文＋出處
+               否則 ⇒ Claude 依段落整理（閘門 B、C）；沒有 API key 或超過預算時回原文摘錄
+    ─► 👎 ─► 缺口去重 ─► 記進 gaps
+
+離線：處理缺口（使用者自己啟動代理，例如 Claude Code 的 /handle-gaps）
+  footnote gaps --open --json ─► 查文件 ─► 寫 FAQ 卡 ─► footnote faq propose
+    ─► 人在 Discord 核准 ─► 同步 ─► 重檢 ─► 通知寫進 outbox（notices 表）─► 回原討論串通知
+```
+
+技術：Go 1.25+、Postgres 18 + pgvector 0.8、[TEI](https://github.com/huggingface/text-embeddings-inference)
+跑 `BAAI/bge-m3`（嵌入）與 `BAAI/bge-reranker-v2-m3`（重排序）、Claude API（整理回答與翻譯補查）。
+全文檢索的中文切詞是純 Go 的 bigram，不需要 cgo。單一執行檔 `footnote`，模組切分見 [docs/design.md](docs/design.md)。
+
 ## FAQ 卡與審核
 
 FAQ 卡與詞彙表存在資料庫（`kb_changes`），每次修改都留紀錄。處理缺口：在這個 repo 開 Claude Code，跑 `/handle-gaps`（或 `/handle-gaps 12` 只處理 G12）。
@@ -187,6 +214,17 @@ make test   # go vet + go test；整合測試連 FOOTNOTE_TEST_DATABASE_URL（�
 
 整合測試需要一個可以清空的 Postgres + pgvector；`make migrate` 會在 compose 的資料庫裡建好 `footnote_test`。
 沒設 `FOOTNOTE_TEST_DATABASE_URL` 時整合測試自動略過。單元測試一律用假的嵌入與重排序，不打真的 TEI。
+
+## In English
+
+> **footnote** is a citation-first Q&A bot for a team's internal docs. It searches your repos (Markdown and
+> xlsx) and human-reviewed FAQ cards, then answers with a link to every source. Retrieval is hybrid
+> (pgvector + full-text, merged with RRF) and reranked by a self-hosted cross-encoder (TEI). If the top score
+> does not clear a calibrated threshold, footnote says it has nothing and records a *knowledge gap* instead of
+> guessing. FAQ cards are returned verbatim; other answers are written by Claude from the retrieved passages
+> only, and two more gates turn an unsupported answer back into "no data". Gaps are deduplicated, turned into
+> FAQ cards offline by an agent, approved by a human in Discord, and the original askers are notified.
+> Written in Go; Discord bot plus a local test page.
 
 ## 授權
 
